@@ -1,4 +1,26 @@
+# Python
 .venv/
 venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# Database
+*.db
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# React build output
+frontend/build/
+
+# Hypothesis test artifacts
+.hypothesis/
+
+# pytest
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
