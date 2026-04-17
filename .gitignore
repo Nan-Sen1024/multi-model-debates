@@ -23,4 +23,7 @@ frontend/build/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.db
+
+# Local git worktrees
+.worktrees/
