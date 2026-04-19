@@ -1,4 +1,4 @@
-import type { SelectHTMLAttributes } from "react";
+import { useEffect, useMemo, useState, type SelectHTMLAttributes } from "react";
 
 export interface ProviderModelCatalog {
   provider_id: string;
@@ -202,18 +202,66 @@ export function ModelRefSelect({
   placeholder = "请选择模型",
   ...props
 }: ModelRefSelectProps): JSX.Element {
+  const [filter, setFilter] = useState("");
+
+  const selectedLabel = useMemo(() => {
+    for (const group of groups) {
+      const match = group.options.find((option) => option.value === value);
+      if (match) {
+        return match.label;
+      }
+    }
+    return value;
+  }, [groups, value]);
+
+  useEffect(() => {
+    setFilter(selectedLabel || "");
+  }, [selectedLabel]);
+
+  const filteredGroups = useMemo(() => {
+    const query = filter.trim().toLowerCase();
+    if (!query) {
+      return groups;
+    }
+    return groups
+      .map((group) => ({
+        ...group,
+        options: group.options.filter((option) =>
+          option.label.toLowerCase().includes(query) ||
+          option.value.toLowerCase().includes(query),
+        ),
+      }))
+      .filter((group) => group.options.length > 0);
+  }, [filter, groups]);
+
   return (
-    <select {...props} value={value} onChange={(event) => onChange(event.target.value)}>
-      <option value="">{placeholder}</option>
-      {groups.map((group) => (
-        <optgroup key={group.label} label={group.label}>
-          {group.options.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </optgroup>
-      ))}
-    </select>
+    <div className="model-ref-select">
+      <input
+        type="text"
+        className="model-ref-filter"
+        value={filter}
+        onChange={(event) => setFilter(event.target.value)}
+        placeholder="输入关键字筛选模型"
+        disabled={props.disabled}
+      />
+      <select
+        {...props}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        <option value="">
+          {filteredGroups.length > 0 ? placeholder : "没有匹配的模型"}
+        </option>
+        {filteredGroups.map((group) => (
+          <optgroup key={group.label} label={group.label}>
+            {group.options.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    </div>
   );
 }

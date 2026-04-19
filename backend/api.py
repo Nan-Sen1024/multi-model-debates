@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -32,11 +33,18 @@ from .llm_gateway import (
     serialize_auth_config,
 )
 from .models import AuthConfig, ProviderConfig, WorkspaceConfig
+from .workspace_reader import read_workspace_file
 from .workspace_scanner import scan_workspace
 from .workspace_capabilities import workspace_capabilities_from_dict, workspace_capabilities_to_dict
 from .orchestrator import CreateSessionRequest, ParticipantInput, SessionOrchestrator
 
 app = FastAPI(title="Multi-Model Debate Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 orchestrator = SessionOrchestrator()
 auth_flow_manager = AuthFlowManager()
 SSE_KEEPALIVE_INTERVAL_SECONDS = 15.0
@@ -454,6 +462,25 @@ async def get_session_workspace(session_id: str):
             capabilities=workspace_capabilities_to_dict(workspace.capabilities),
             scan_result=scan_result,
         )
+    except ValidationError as exc:
+        return error_response(exc, 404)
+
+
+@app.get("/api/sessions/{session_id}/workspace/file")
+async def get_session_workspace_file(session_id: str, path: str):
+    try:
+        session = await orchestrator.get_session(session_id)
+        workspace = session.config.workspace
+        if workspace is None:
+            raise ValidationError("会话未配置 workspace。", field="workspace")
+
+        scan_result = scan_workspace(workspace.root_path, workspace.scan_excludes)
+        file_view = read_workspace_file(scan_result, path)
+        return {
+            "path": file_view.path,
+            "content": file_view.content,
+            "truncated": file_view.truncated,
+        }
     except ValidationError as exc:
         return error_response(exc, 404)
 

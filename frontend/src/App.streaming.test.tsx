@@ -187,4 +187,57 @@ describe("App streaming watchdog", () => {
 
     expect(container.textContent).toContain("still streaming");
   });
+
+  test("does not force scroll back to bottom while the user is reading older messages", async () => {
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const startButton = Array.from(container.querySelectorAll("button")).find(
+      (node) => node.textContent?.includes("开始下一轮"),
+    ) as HTMLButtonElement | undefined;
+
+    expect(startButton).toBeDefined();
+
+    await act(async () => {
+      startButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(streamCallback).not.toBeNull();
+
+    const messageStream = container.querySelector(".message-stream") as HTMLDivElement | null;
+    expect(messageStream).not.toBeNull();
+
+    Object.defineProperty(messageStream, "scrollHeight", {
+      configurable: true,
+      value: 1000,
+    });
+    Object.defineProperty(messageStream, "clientHeight", {
+      configurable: true,
+      value: 320,
+    });
+    Object.defineProperty(messageStream, "scrollTop", {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
+
+    (Element.prototype.scrollIntoView as jest.Mock).mockClear();
+
+    await act(async () => {
+      messageStream?.dispatchEvent(new Event("scroll"));
+      streamCallback?.("chunk", {
+        participant_id: "ModelA",
+        content: "new chunk while reading history",
+        round: 1,
+      });
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("new chunk while reading history");
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+  });
 });

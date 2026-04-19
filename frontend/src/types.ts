@@ -118,6 +118,12 @@ export interface SessionWorkspaceView extends WorkspaceConfigRecord {
   tree: WorkspaceTreeEntry[];
 }
 
+export interface WorkspaceFileContentRecord {
+  path: string;
+  content: string;
+  truncated: boolean;
+}
+
 export interface ProviderRecord {
   id: string;
   name: string;

@@ -8,11 +8,27 @@ import {
   SessionResponse,
   SessionSnapshot,
   SessionWorkspaceView,
+  WorkspaceFileContentRecord,
   WorkspaceConfigRecord,
   StreamPayload,
 } from "./types";
 
 const API_BASE = "/api";
+
+function resolveSessionStreamBase(): string {
+  const configured = process.env.REACT_APP_SSE_BASE_URL?.trim();
+  if (configured) {
+    return configured.replace(/\/+$/, "");
+  }
+  if (
+    typeof window !== "undefined" &&
+    window.location.protocol.startsWith("http") &&
+    window.location.port === "3000"
+  ) {
+    return "http://127.0.0.1:8000";
+  }
+  return "";
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -65,6 +81,15 @@ export async function getSessionWorkspace(
   sessionId: string,
 ): Promise<SessionWorkspaceView> {
   return request<SessionWorkspaceView>(`/sessions/${sessionId}/workspace`);
+}
+
+export async function getWorkspaceFileContent(
+  sessionId: string,
+  path: string,
+): Promise<WorkspaceFileContentRecord> {
+  return request<WorkspaceFileContentRecord>(
+    `/sessions/${sessionId}/workspace/file?path=${encodeURIComponent(path)}`,
+  );
 }
 
 export async function previewWorkspace(input: {
@@ -220,7 +245,10 @@ export function openSessionStream(
   sessionId: string,
   onEvent: (event: string, payload: StreamPayload) => void,
 ): () => void {
-  const source = new EventSource(`${API_BASE}/sessions/${sessionId}/stream`);
+  const streamBase = resolveSessionStreamBase();
+  const source = new EventSource(
+    `${streamBase}${API_BASE}/sessions/${sessionId}/stream`,
+  );
   const terminalEvents = new Set(["round_end", "session_end", "error"]);
   let closed = false;
   let terminalEventSeen = false;

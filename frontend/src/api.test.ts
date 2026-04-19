@@ -39,9 +39,28 @@ class MockEventSource {
 }
 
 describe("openSessionStream", () => {
+  const originalLocation = window.location;
+
   beforeEach(() => {
     MockEventSource.instances = [];
     (globalThis as { EventSource?: unknown }).EventSource = MockEventSource;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...originalLocation,
+        protocol: "http:",
+        hostname: "localhost",
+        port: "3000",
+        origin: "http://localhost:3000",
+      },
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: originalLocation,
+    });
   });
 
   test("emits a transport error before any terminal stream event", () => {
@@ -151,5 +170,13 @@ describe("openSessionStream", () => {
         },
       },
     ]);
+  });
+
+  test("bypasses the CRA dev proxy for SSE in local development", () => {
+    openSessionStream("session-dev", () => {});
+
+    expect(MockEventSource.instances[0].url).toBe(
+      "http://127.0.0.1:8000/api/sessions/session-dev/stream",
+    );
   });
 });

@@ -1,5 +1,6 @@
 import React, { act } from "react";
 import { createRoot, Root } from "react-dom/client";
+import { Simulate } from "react-dom/test-utils";
 
 import App from "./App";
 
@@ -228,5 +229,153 @@ describe("App dynamic model dropdown", () => {
 
     expect(providerSelect!.value).toBe("provider-xai");
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/model-catalog/discover").length).toBeGreaterThan(0);
+  });
+
+  test("keeps Custom_ID input focused while typing", async () => {
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([]);
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("创建会话"),
+    ) as HTMLButtonElement | undefined;
+    expect(createSessionTab).toBeDefined();
+
+    await act(async () => {
+      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const customIdInput = Array.from(container.querySelectorAll(".participant-card input")).find((node) =>
+      (node as HTMLInputElement).placeholder === "Model_A",
+    ) as HTMLInputElement | undefined;
+    expect(customIdInput).toBeDefined();
+
+    await act(async () => {
+      customIdInput!.focus();
+      Simulate.change(customIdInput!, { target: { value: "M" } });
+      await Promise.resolve();
+    });
+
+    expect(document.activeElement).toBe(customIdInput);
+    expect(customIdInput?.value).toBe("M");
+  });
+
+  test("filters participant model options by typed keyword", async () => {
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([
+          {
+            id: "provider-openai",
+            name: "openai-primary",
+            provider_type: "openai",
+            base_url: "https://api.openai.com/v1",
+            api_format: "openai-completions",
+            auth_type: "api_key",
+            auth_metadata: {},
+            auth_status: "ready",
+            auth_expires_at: null,
+            fallback_ids: [],
+            is_active: true,
+          },
+          {
+            id: "provider-xai",
+            name: "xai-primary",
+            provider_type: "xai",
+            base_url: "https://api.x.ai/v1",
+            api_format: "openai-completions",
+            auth_type: "api_key",
+            auth_metadata: {},
+            auth_status: "ready",
+            auth_expires_at: null,
+            fallback_ids: [],
+            is_active: true,
+          },
+        ]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/model-catalog/discover" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body || "{}")) as Record<string, unknown>;
+        if (body.provider_id === "provider-openai") {
+          return mockJsonResponse({
+            provider_id: "provider-openai",
+            provider_name: "openai-primary",
+            provider_type: "openai",
+            models: ["gpt-5.4", "gpt-4o-mini"],
+            detected_at: 123,
+          });
+        }
+        if (body.provider_id === "provider-xai") {
+          return mockJsonResponse({
+            provider_id: "provider-xai",
+            provider_name: "xai-primary",
+            provider_type: "xai",
+            models: ["grok-4.3"],
+            detected_at: 123,
+          });
+        }
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("创建会话"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const participantCard = Array.from(container.querySelectorAll(".participant-card")).find(
+      (node) => node.textContent?.includes("参与者 1"),
+    ) as HTMLElement | undefined;
+    expect(participantCard).toBeDefined();
+
+    const modelField = Array.from(participantCard?.querySelectorAll(".field") || []).find((node) =>
+      node.textContent?.includes("模型选择"),
+    ) as HTMLElement | undefined;
+    expect(modelField).toBeDefined();
+
+    const filterInput = modelField?.querySelector(
+      'input[placeholder="输入关键字筛选模型"]',
+    ) as HTMLInputElement | undefined;
+    const modelSelect = modelField?.querySelector("select") as HTMLSelectElement | undefined;
+    expect(filterInput).toBeDefined();
+    expect(modelSelect).toBeDefined();
+
+    await act(async () => {
+      Simulate.change(filterInput!, { target: { value: "gpt" } });
+      await Promise.resolve();
+    });
+
+    const optionTexts = Array.from(modelSelect!.options).map((option) => option.textContent);
+    expect(optionTexts).toContain("gpt-5.4");
+    expect(optionTexts).toContain("gpt-4o-mini");
+    expect(optionTexts).not.toContain("grok-4.3");
   });
 });

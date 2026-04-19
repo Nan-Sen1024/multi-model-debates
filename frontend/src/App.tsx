@@ -1,6 +1,5 @@
 import React, {
   FormEvent,
-  useDeferredValue,
   useEffect,
   useRef,
   useState,
@@ -233,8 +232,6 @@ export default function App(): JSX.Element {
   const visibleMessages = streamView.liveMessage
     ? [...streamView.messages, streamView.liveMessage]
     : streamView.messages;
-  const deferredMessages = useDeferredValue(visibleMessages);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     return () => {
@@ -259,10 +256,6 @@ export default function App(): JSX.Element {
       cancelled = true;
     };
   }, [providers]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [deferredMessages]);
 
   useEffect(() => {
     saveActiveTab(activeTab);
@@ -967,7 +960,6 @@ export default function App(): JSX.Element {
           historyExport={historyExport}
           input={input}
           setInput={setInput}
-          messagesEndRef={messagesEndRef}
           onSendMessage={handleSendMessage}
           onSelectSession={handleSelectSession}
           onRenameSession={handleRenameSession}
@@ -1659,7 +1651,7 @@ function TabCreateSession({
               );
 
               return (
-                <div className="participant-card" key={`${p.custom_id}-${i}`}>
+                <div className="participant-card" key={`participant-${i}`}>
                   <div className="participant-card-head">
                     <strong>参与者 {i + 1}</strong>
                     <button type="button" className="ghost-button small danger" onClick={() => onRemoveParticipant(i)} disabled={participants.length <= 2}>删除</button>
@@ -1735,7 +1727,6 @@ interface TabSessionDetailProps {
   historyExport: string;
   input: string;
   setInput: (v: string) => void;
-  messagesEndRef: React.RefObject<HTMLDivElement>;
   onSendMessage: (e: FormEvent) => void;
   onSelectSession: (sessionId: string) => void;
   onRenameSession: (sessionId: string) => void;
@@ -1747,13 +1738,18 @@ interface TabSessionDetailProps {
 
 function TabSessionDetail({
   session, sessionList, workspace, messages, streamState, onSetStreamState, autoStartToken, snapshot, setSnapshot, snapshotOpen, setSnapshotOpen,
-  historyExport, input, setInput, messagesEndRef,
+  historyExport, input, setInput,
   onSendMessage, onSelectSession, onRenameSession, onDeleteSession,
   onSaveSnapshot, onExportHistory, onStreamEvent,
 }: TabSessionDetailProps) {
   const closeStreamRef = useRef<(() => void) | null>(null);
   const streamTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messageStreamRef = useRef<HTMLDivElement>(null);
+  const autoScrollPinnedRef = useRef(true);
+  const sessionResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [clockTs, setClockTs] = useState(() => Date.now());
+  const [rightPaneWidth, setRightPaneWidth] = useState(420);
   const isStreaming = streamState === "connecting" || streamState === "streaming";
   const lastAutoStartTokenRef = useRef(0);
   const streamStateLabel =
@@ -1789,11 +1785,44 @@ function TabSessionDetail({
   }, []);
 
   useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!sessionResizeRef.current) {
+        return;
+      }
+      const delta = sessionResizeRef.current.startX - event.clientX;
+      setRightPaneWidth(clampPaneWidth(sessionResizeRef.current.startWidth + delta));
+    };
+    const handleMouseUp = () => {
+      sessionResizeRef.current = null;
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    autoScrollPinnedRef.current = true;
+  }, [session?.id]);
+
+  useEffect(() => {
     closeStreamRef.current?.();
     closeStreamRef.current = null;
     clearStreamTimeout();
     onSetStreamState("idle");
   }, [session?.id]);
+
+  useEffect(() => {
+    if (!autoScrollPinnedRef.current) {
+      return;
+    }
+    messagesEndRef.current?.scrollIntoView({
+      behavior: isStreaming ? "auto" : "smooth",
+    });
+  }, [messages, isStreaming]);
 
   useEffect(() => {
     if (!session || session.mode !== "code_workspace") {
@@ -1822,6 +1851,25 @@ function TabSessionDetail({
     }, 180000);
   }
 
+  function isNearMessageStreamBottom(node: HTMLDivElement | null) {
+    if (!node) {
+      return true;
+    }
+    return node.scrollHeight - node.clientHeight - node.scrollTop <= 72;
+  }
+
+  function handleMessageStreamScroll(event: React.UIEvent<HTMLDivElement>) {
+    autoScrollPinnedRef.current = isNearMessageStreamBottom(event.currentTarget);
+  }
+
+  function startSessionResize(event: React.MouseEvent<HTMLDivElement>) {
+    sessionResizeRef.current = {
+      startX: event.clientX,
+      startWidth: rightPaneWidth,
+    };
+    event.preventDefault();
+  }
+
   function handleNextRound() {
     if (!session) {
       return;
@@ -1832,6 +1880,8 @@ function TabSessionDetail({
       onStreamEvent("error", { message: "生成已手动停止。" });
       return;
     }
+    autoScrollPinnedRef.current = true;
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     onSetStreamState("connecting");
     // 每次调用 GET /stream 都会触发后端 dispatch_round 调度完整一轮
     const close = openSessionStream(session.id, (eventName, payload) => {
@@ -1851,7 +1901,15 @@ function TabSessionDetail({
 
   return (
     <div className="tab-content">
-      <div className="session-layout">
+      <div
+        className="session-layout"
+        style={{
+          gridTemplateColumns:
+            typeof window !== "undefined" && window.innerWidth <= 980
+              ? undefined
+              : `minmax(0, 1fr) 12px ${rightPaneWidth}px`,
+        }}
+      >
         {/* Left: chat */}
         <div className="panel chat-panel-new">
           <nav className="session-history-strip" aria-label="Sessions">
@@ -1907,7 +1965,11 @@ function TabSessionDetail({
           )}
 
           {/* Messages */}
-          <div className="message-stream">
+          <div
+            ref={messageStreamRef}
+            className="message-stream"
+            onScroll={handleMessageStreamScroll}
+          >
             {!session
               ? <div className="empty-state">请选择一个历史会话查看消息和快照。</div>
               : messages.length === 0
@@ -1968,6 +2030,12 @@ function TabSessionDetail({
           )}
         </div>
 
+        <div
+          className="session-layout-resizer"
+          data-session-layout-resizer="true"
+          onMouseDown={startSessionResize}
+        />
+
         {/* Right: workspace / snapshot */}
         <div className="panel snapshot-panel-new">
           <div className="panel-head">
@@ -1979,6 +2047,7 @@ function TabSessionDetail({
 
           {session?.mode === "code_workspace" && (
             <WorkspaceSessionPanel
+              sessionId={session.id}
               workspace={workspace}
               participants={session.participants}
               capabilities={session.workspace?.capabilities}
@@ -2019,4 +2088,8 @@ function TabSessionDetail({
       </div>
     </div>
   );
+}
+
+function clampPaneWidth(value: number): number {
+  return Math.min(760, Math.max(360, value));
 }

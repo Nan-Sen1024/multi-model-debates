@@ -281,6 +281,115 @@ describe("App code workspace mode", () => {
     expect(container.textContent).toContain("正在查看 README");
   });
 
+  test("allows resizing the session chat and workspace panes", async () => {
+    localStorage.setItem("mmdebate.lastSessionId", "workspace-session");
+
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([
+          {
+            id: "workspace-session",
+            title: "workspace",
+            topic: "评审本地仓库",
+            mode: "code_workspace",
+            status: "active",
+            current_round: 1,
+            updated_at: 300,
+            participant_count: 2,
+            last_message_preview: "assistant reply",
+          },
+        ]);
+      }
+      if (path === "/api/sessions/workspace-session") {
+        return mockJsonResponse({
+          id: "workspace-session",
+          title: "workspace",
+          topic: "评审本地仓库",
+          mode: "code_workspace",
+          status: "active",
+          current_round: 1,
+          participants: [
+            { id: "p1", custom_id: "claude", model_ref: "anthropic/claude-4.6", is_active: true },
+            { id: "p2", custom_id: "codex", model_ref: "openai/gpt-5.4", is_active: true },
+          ],
+          workspace: {
+            root_path: "D:/repo/demo",
+            display_name: "demo-repo",
+            repo_fingerprint: "fingerprint-123",
+            scan_excludes: [],
+            selected_paths: ["README.md"],
+            index_status: "ready",
+            last_scanned_at: 1710000000,
+            summary: "2 个文件，1 个顶层目录/文件",
+          },
+        });
+      }
+      if (path === "/api/sessions/workspace-session/snapshot") {
+        return mockJsonResponse({
+          topic: "评审本地仓库",
+          mode: "code_workspace",
+          participant_summaries: {},
+          consensus_list: [],
+          key_events: [],
+        });
+      }
+      if (path === "/api/sessions/workspace-session/messages") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions/workspace-session/workspace") {
+        return mockJsonResponse({
+          root_path: "D:/repo/demo",
+          display_name: "demo-repo",
+          repo_fingerprint: "fingerprint-123",
+          scan_excludes: [],
+          selected_paths: ["README.md"],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "2 个文件，1 个顶层目录/文件",
+          files: ["README.md", "src/app.py"],
+          tree: [
+            {
+              name: "README.md",
+              path: "README.md",
+              kind: "file",
+              children: [],
+            },
+          ],
+        });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const sessionLayout = container.querySelector(".session-layout") as HTMLDivElement | null;
+    const resizer = container.querySelector(
+      '[data-session-layout-resizer="true"]',
+    ) as HTMLDivElement | null;
+
+    expect(sessionLayout).not.toBeNull();
+    expect(resizer).not.toBeNull();
+    expect(sessionLayout?.style.gridTemplateColumns).toContain("420px");
+
+    await act(async () => {
+      resizer?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 700 }));
+      window.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: 580 }));
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(sessionLayout?.style.gridTemplateColumns).toContain("540px");
+  });
+
   test("scans workspace preview and submits selected tree paths", async () => {
     let createSessionBody: Record<string, unknown> | null = null;
 

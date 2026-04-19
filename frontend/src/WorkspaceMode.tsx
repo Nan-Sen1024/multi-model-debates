@@ -1,10 +1,11 @@
 import React from "react";
 
-import { previewWorkspace } from "./api";
+import { getWorkspaceFileContent, previewWorkspace } from "./api";
 import type {
   MCPServerConfig,
   ParticipantConfig,
   SessionWorkspaceView,
+  WorkspaceFileContentRecord,
   WorkspaceCapabilityManifest,
   WorkspaceTreeEntry,
 } from "./types";
@@ -62,6 +63,7 @@ interface WorkspaceCreatePanelProps {
 }
 
 interface WorkspaceSessionPanelProps {
+  sessionId: string;
   workspace: SessionWorkspaceView | null;
   participants: ParticipantConfig[];
   capabilities?: WorkspaceCapabilityManifest | null;
@@ -924,10 +926,47 @@ function WorkspaceSelectableTreeNode({
 }
 
 export function WorkspaceSessionPanel({
+  sessionId,
   workspace,
   participants,
   capabilities,
 }: WorkspaceSessionPanelProps): JSX.Element {
+  const [activeFilePath, setActiveFilePath] = React.useState<string | null>(null);
+  const [fileView, setFileView] = React.useState<WorkspaceFileContentRecord | null>(null);
+  const [fileError, setFileError] = React.useState<string | null>(null);
+  const [fileLoadingPath, setFileLoadingPath] = React.useState<string | null>(null);
+  const [expandedDirs, setExpandedDirs] = React.useState<Record<string, boolean>>({});
+  const [treePaneWidth, setTreePaneWidth] = React.useState(280);
+  const browserResizeRef = React.useRef<{ startX: number; startWidth: number } | null>(null);
+
+  React.useEffect(() => {
+    setActiveFilePath(null);
+    setFileView(null);
+    setFileError(null);
+    setFileLoadingPath(null);
+    setExpandedDirs({});
+  }, [workspace?.root_path, workspace?.repo_fingerprint]);
+
+  React.useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!browserResizeRef.current) {
+        return;
+      }
+      const delta = event.clientX - browserResizeRef.current.startX;
+      setTreePaneWidth(clampPaneSize(browserResizeRef.current.startWidth + delta, 220, 520));
+    };
+    const handleMouseUp = () => {
+      browserResizeRef.current = null;
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, []);
+
   if (!workspace) {
     return (
       <div className="workspace-session-panel empty-state">
@@ -937,6 +976,36 @@ export function WorkspaceSessionPanel({
   }
 
   const capabilityManifest = capabilities || workspace.capabilities || null;
+
+  const toggleDirectory = (path: string) => {
+    setExpandedDirs((current) => ({
+      ...current,
+      [path]: !(current[path] ?? defaultDirectoryExpanded(path)),
+    }));
+  };
+
+  const startBrowserResize = (event: React.MouseEvent<HTMLDivElement>) => {
+    browserResizeRef.current = {
+      startX: event.clientX,
+      startWidth: treePaneWidth,
+    };
+    event.preventDefault();
+  };
+
+  const openWorkspaceFile = async (path: string) => {
+    setActiveFilePath(path);
+    setFileLoadingPath(path);
+    setFileError(null);
+    try {
+      const result = await getWorkspaceFileContent(sessionId, path);
+      setFileView(result);
+    } catch (err) {
+      setFileView(null);
+      setFileError((err as Error).message);
+    } finally {
+      setFileLoadingPath(null);
+    }
+  };
 
   return (
     <div className="workspace-session-panel stack">
@@ -1022,10 +1091,49 @@ export function WorkspaceSessionPanel({
       </div>
 
       <div className="workspace-card workspace-tree-card">
-        <h4 className="workspace-card-title">仓库树</h4>
-        {workspace.tree.length > 0
-          ? <WorkspaceTreeList entries={workspace.tree} />
-          : <div className="muted-text">没有扫描到可展示的文件。</div>}
+        <h4 className="workspace-card-title">仓库浏览器</h4>
+        {workspace.tree.length > 0 ? (
+          <div
+            className="workspace-file-browser"
+            style={{
+              gridTemplateColumns:
+                typeof window !== "undefined" && window.innerWidth <= 980
+                  ? undefined
+                  : `${treePaneWidth}px 12px minmax(0, 1fr)`,
+            }}
+          >
+            <div className="workspace-tree-pane">
+              <WorkspaceTreeList
+                entries={workspace.tree}
+                activeFilePath={activeFilePath}
+                expandedDirs={expandedDirs}
+                onToggleDir={toggleDirectory}
+                onSelectFile={openWorkspaceFile}
+              />
+            </div>
+            <div
+              className="workspace-pane-resizer"
+              data-workspace-browser-resizer="true"
+              onMouseDown={startBrowserResize}
+            />
+            <div className="workspace-file-pane">
+              <div className="workspace-file-pane-head">
+                <strong>{fileView?.path || activeFilePath || "未选择文件"}</strong>
+                {fileLoadingPath ? <span className="workspace-path">加载中…</span> : null}
+                {fileView?.truncated ? <span className="workspace-path">已截断</span> : null}
+              </div>
+              {fileError ? (
+                <div className="workspace-preview-error">{fileError}</div>
+              ) : fileView ? (
+                <pre className="workspace-file-content">{fileView.content}</pre>
+              ) : (
+                <div className="muted-text">点击左侧文件查看正文内容。</div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="muted-text">没有扫描到可展示的文件。</div>
+        )}
       </div>
 
       <div className="workspace-card">
@@ -1040,24 +1148,103 @@ export function WorkspaceSessionPanel({
   );
 }
 
-function WorkspaceTreeList({ entries }: { entries: WorkspaceTreeEntry[] }): JSX.Element {
+function WorkspaceTreeList({
+  entries,
+  activeFilePath,
+  expandedDirs,
+  onToggleDir,
+  onSelectFile,
+  depth = 0,
+}: {
+  entries: WorkspaceTreeEntry[];
+  activeFilePath: string | null;
+  expandedDirs: Record<string, boolean>;
+  onToggleDir: (path: string) => void;
+  onSelectFile: (path: string) => void;
+  depth?: number;
+}): JSX.Element {
   return (
     <ul className="workspace-tree">
       {entries.map((entry) => (
-        <WorkspaceTreeNode key={entry.path} entry={entry} />
+        <WorkspaceTreeNode
+          key={entry.path}
+          entry={entry}
+          activeFilePath={activeFilePath}
+          expandedDirs={expandedDirs}
+          onToggleDir={onToggleDir}
+          onSelectFile={onSelectFile}
+          depth={depth}
+        />
       ))}
     </ul>
   );
 }
 
-function WorkspaceTreeNode({ entry }: { entry: WorkspaceTreeEntry }): JSX.Element {
+function WorkspaceTreeNode({
+  entry,
+  activeFilePath,
+  expandedDirs,
+  onToggleDir,
+  onSelectFile,
+  depth,
+}: {
+  entry: WorkspaceTreeEntry;
+  activeFilePath: string | null;
+  expandedDirs: Record<string, boolean>;
+  onToggleDir: (path: string) => void;
+  onSelectFile: (path: string) => void;
+  depth: number;
+}): JSX.Element {
+  const isDir = entry.kind === "dir";
+  const expanded = expandedDirs[entry.path] ?? defaultDirectoryExpanded(entry.path, depth);
+
   return (
     <li className={`workspace-tree-node workspace-tree-node-${entry.kind}`}>
-      <div className="workspace-tree-label">
-        <span className="workspace-tree-kind">{entry.kind === "dir" ? "📁" : "📄"}</span>
-        <span>{entry.name}</span>
-      </div>
-      {entry.children.length > 0 && <WorkspaceTreeList entries={entry.children} />}
+      {isDir ? (
+        <>
+          <button
+            type="button"
+            className="workspace-tree-button"
+            data-workspace-dir-path={entry.path}
+            onClick={() => onToggleDir(entry.path)}
+          >
+            <span className="workspace-tree-kind">{expanded ? "📂" : "📁"}</span>
+            <span>{entry.name}</span>
+            <span className="workspace-tree-path">{entry.path}</span>
+          </button>
+          {expanded && entry.children.length > 0 ? (
+            <WorkspaceTreeList
+              entries={entry.children}
+              activeFilePath={activeFilePath}
+              expandedDirs={expandedDirs}
+              onToggleDir={onToggleDir}
+              onSelectFile={onSelectFile}
+              depth={depth + 1}
+            />
+          ) : null}
+        </>
+      ) : (
+        <button
+          type="button"
+          className={`workspace-tree-button workspace-tree-file-button${
+            activeFilePath === entry.path ? " workspace-tree-file-button-active" : ""
+          }`}
+          data-workspace-file-path={entry.path}
+          onClick={() => onSelectFile(entry.path)}
+        >
+          <span className="workspace-tree-kind">📄</span>
+          <span>{entry.name}</span>
+          <span className="workspace-tree-path">{entry.path}</span>
+        </button>
+      )}
     </li>
   );
+}
+
+function defaultDirectoryExpanded(path: string, depth = 0): boolean {
+  return depth === 0 || path.split("/").length <= 2;
+}
+
+function clampPaneSize(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
