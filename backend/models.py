@@ -15,6 +15,7 @@ from .enums import (
     ProviderType,
     SessionStatus,
 )
+from .workspace_capabilities import WorkspaceCapabilityManifest
 
 
 @dataclass
@@ -49,6 +50,19 @@ class ProviderConfig:
 
 
 @dataclass
+class WorkspaceConfig:
+    root_path: str
+    display_name: Optional[str] = None
+    repo_fingerprint: Optional[str] = None
+    scan_excludes: List[str] = field(default_factory=list)
+    selected_paths: List[str] = field(default_factory=list)
+    index_status: str = "pending"
+    last_scanned_at: Optional[int] = None
+    summary: Optional[str] = None
+    capabilities: Optional[WorkspaceCapabilityManifest] = None
+
+
+@dataclass
 class ModelParticipant:
     id: str
     session_id: str
@@ -70,6 +84,8 @@ class SessionConfig:
     context_threshold: float = 0.7
     summary_model: Optional[str] = None
     delegate_all_tools: bool = False
+    display_title: Optional[str] = None
+    workspace: Optional[WorkspaceConfig] = None
 
 
 @dataclass

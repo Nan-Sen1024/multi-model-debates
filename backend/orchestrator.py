@@ -19,7 +19,11 @@ from .enums import APIFormat, AuthType, CollaborationMode, MessageType, Provider
 from .exceptions import ValidationError
 from .llm_gateway import LLMGatewayClient, ProviderRouter, deserialize_auth_config, validate_model_ref
 from .message_store import MessageStore
-from .models import AuthConfig, Checkpoint, CollaborationMessage, ModelParticipant, ProviderConfig, Session, SessionConfig, SessionSnapshot
+from .models import AuthConfig, Checkpoint, CollaborationMessage, ModelParticipant, ProviderConfig, Session, SessionConfig, SessionSnapshot, WorkspaceConfig
+from .workspace_context import build_workspace_file_context
+from .workspace_capabilities import workspace_capabilities_from_dict, workspace_capabilities_to_dict
+from .workspace_router import resolve_workspace_targets
+from .workspace_scanner import scan_workspace
 from .snapshot_manager import SnapshotManager
 from .strategies import StrategyRegistry
 
@@ -45,6 +49,7 @@ class CreateSessionRequest:
     retention_window: int = 10
     context_threshold: float = 0.7
     summary_model: Optional[str] = None
+    workspace: Optional[WorkspaceConfig] = None
 
 
 @dataclass
@@ -61,6 +66,19 @@ class SessionSummary:
     session_id: str
     reason: str
     summary_text: str
+
+
+@dataclass
+class SessionListItem:
+    id: str
+    title: str
+    topic: str
+    mode: CollaborationMode
+    status: SessionStatus
+    current_round: int
+    updated_at: int
+    participant_count: int
+    last_message_preview: str
 
 
 @dataclass
@@ -128,6 +146,8 @@ class SessionOrchestrator:
                 retention_window=config.retention_window,
                 context_threshold=config.context_threshold,
                 summary_model=config.summary_model,
+                display_title=config.topic,
+                workspace=config.workspace,
             ),
             snapshot=SessionSnapshot(
                 topic=config.topic,
@@ -187,6 +207,8 @@ class SessionOrchestrator:
                 context_threshold=cfg.get("context_threshold", 0.7),
                 summary_model=cfg.get("summary_model"),
                 delegate_all_tools=cfg.get("delegate_all_tools", False),
+                display_title=cfg.get("display_title"),
+                workspace=self._deserialize_workspace_config(cfg.get("workspace")),
             ),
             snapshot=SessionSnapshot(
                 topic=session_row["topic"],
@@ -213,8 +235,73 @@ class SessionOrchestrator:
     async def get_session(self, session_id: str) -> Session:
         return await self.load_session(session_id)
 
+    async def list_sessions(self) -> List[SessionListItem]:
+        await init_db(self.db_path)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    s.id,
+                    s.topic,
+                    s.mode,
+                    s.status,
+                    s.config,
+                    s.updated_at,
+                    (
+                        SELECT COUNT(*)
+                        FROM model_participants p
+                        WHERE p.session_id = s.id
+                    ) AS participant_count,
+                    (
+                        SELECT m.content
+                        FROM collaboration_messages m
+                        WHERE m.session_id = s.id
+                        ORDER BY m.created_at DESC, m.rowid DESC
+                        LIMIT 1
+                    ) AS last_message_preview
+                FROM collaboration_sessions s
+                ORDER BY s.updated_at DESC, s.created_at DESC, s.id DESC
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        items: List[SessionListItem] = []
+        for row in rows:
+            config = json.loads(row["config"] or "{}")
+            items.append(
+                SessionListItem(
+                    id=row["id"],
+                    title=str(config.get("display_title") or row["topic"]),
+                    topic=row["topic"],
+                    mode=CollaborationMode(row["mode"]),
+                    status=SessionStatus(row["status"]),
+                    current_round=int(config.get("current_round", 0)),
+                    updated_at=int(row["updated_at"] or 0),
+                    participant_count=int(row["participant_count"] or 0),
+                    last_message_preview=row["last_message_preview"] or "",
+                )
+            )
+        return items
+
     async def get_snapshot(self, session_id: str) -> SessionSnapshot:
         return (await self.load_session(session_id)).snapshot
+
+    async def get_messages(self, session_id: str) -> List[CollaborationMessage]:
+        await self.load_session(session_id)
+        return await self.message_store.load_messages(session_id)
+
+    async def update_session_title(
+        self,
+        session_id: str,
+        title: Optional[str],
+    ) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            normalized = title.strip() if isinstance(title, str) else ""
+            session.config.display_title = normalized or session.topic
+            await self._persist_session_runtime(session)
+            return session
 
     async def update_snapshot(
         self,
@@ -253,6 +340,12 @@ class SessionOrchestrator:
         return session
 
     async def dispatch_next(self, session_id: str) -> AsyncIterator[StreamChunk]:
+        session = await self.load_session(session_id)
+        if session.mode == CollaborationMode.CODE_WORKSPACE:
+            async for chunk in self._dispatch_workspace_round(session_id):
+                yield chunk
+            return
+
         runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
         async with self._get_session_lock(session_id):
             session = await self.load_session(session_id)
@@ -273,7 +366,8 @@ class SessionOrchestrator:
             runtime.is_generating = True
             try:
                 full_content = ""
-                prompt_messages = self._build_dispatch_messages(session, participant, messages, runtime.manual_topic_reminder, strategy.build_system_prompt(participant, session))
+                renderable_messages = await self.message_store.load_renderable_messages(session_id)
+                prompt_messages = self._build_dispatch_messages(session, participant, renderable_messages, runtime.manual_topic_reminder, strategy.build_system_prompt(participant, session))
                 runtime.manual_topic_reminder = False
                 try:
                     async for chunk in self._iter_model_stream(participant, prompt_messages):
@@ -312,6 +406,122 @@ class SessionOrchestrator:
                 if termination and termination.should_terminate:
                     summary = await self.terminate_session(session.id, termination.reason)
                     yield StreamChunk("session_end", round_number=session.current_round, metadata={"reason": summary.reason, "summary": summary.summary_text})
+            finally:
+                runtime.is_generating = False
+
+    async def dispatch_round(self, session_id: str) -> AsyncIterator[StreamChunk]:
+        session = await self.load_session(session_id)
+        if session.mode == CollaborationMode.CODE_WORKSPACE:
+            async for chunk in self._dispatch_workspace_round(session_id):
+                yield chunk
+            return
+
+        emitted_turn = False
+
+        while True:
+            emitted_any = False
+            async for chunk in self.dispatch_next(session_id):
+                emitted_any = True
+                if chunk.event == "turn_end":
+                    emitted_turn = True
+                yield chunk
+                if chunk.event in {"session_end", "error"}:
+                    return
+
+            if not emitted_any:
+                return
+
+            session = await self.load_session(session_id)
+            if session.status != SessionStatus.ACTIVE:
+                return
+
+            if emitted_turn and session.next_speaker_index == 0:
+                yield StreamChunk("round_end", round_number=session.current_round)
+                return
+
+    async def _dispatch_workspace_round(self, session_id: str) -> AsyncIterator[StreamChunk]:
+        runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            if session.status != SessionStatus.ACTIVE:
+                return
+            if session.config.workspace is None:
+                raise ValidationError("code_workspace 会话缺少 workspace 配置。", field="workspace")
+
+            try:
+                workspace_scan = scan_workspace(
+                    session.config.workspace.root_path,
+                    session.config.workspace.scan_excludes,
+                )
+            except ValidationError as exc:
+                yield StreamChunk(
+                    "error",
+                    round_number=session.current_round,
+                    metadata={"code": "WORKSPACE_INVALID", "message": exc.message},
+                )
+                return
+
+            messages = await self.message_store.load_renderable_messages(session_id)
+            session.current_round += 1
+            session.next_speaker_index = 0
+
+            latest_user_message = ""
+            for message in reversed(messages):
+                if message.message_type == MessageType.USER_INTERVENTION:
+                    latest_user_message = message.content
+                    break
+
+            targets = resolve_workspace_targets(latest_user_message, session.participants)
+            if not targets:
+                return
+
+            runtime.is_generating = True
+            try:
+                for participant in targets:
+                    prompt_messages = self._build_workspace_dispatch_messages(
+                        session,
+                        participant,
+                        messages,
+                        workspace_scan,
+                    )
+                    full_content = ""
+                    try:
+                        async for chunk in self._iter_model_stream(participant, prompt_messages):
+                            full_content += chunk
+                            yield StreamChunk(
+                                "chunk",
+                                participant_id=participant.custom_id,
+                                content=chunk,
+                                round_number=session.current_round,
+                            )
+                    except Exception as exc:
+                        logger.exception("工作区参与者 %s 调用失败", participant.custom_id)
+                        yield StreamChunk(
+                            "error",
+                            participant_id=participant.custom_id,
+                            round_number=session.current_round,
+                            metadata={"code": "PROVIDER_UNAVAILABLE", "message": str(exc)},
+                        )
+                        return
+
+                    message = CollaborationMessage(
+                        id=str(uuid.uuid4()),
+                        session_id=session.id,
+                        sender_id=participant.custom_id,
+                        message_type=MessageType.DIALOGUE,
+                        content=full_content,
+                        round_number=session.current_round,
+                    )
+                    drift = self.drift_detector.check_drift(message, session)
+                    if drift.score is not None:
+                        message.drift_score = drift.score
+                    await self.message_store.store_message(message)
+                    self.snapshot_manager.update(session, participant, message.content)
+                    messages.append(message)
+                    yield StreamChunk("turn_end", participant_id=participant.custom_id, round_number=session.current_round)
+
+                await self._persist_session_runtime(session)
+                yield StreamChunk("round_end", round_number=session.current_round)
             finally:
                 runtime.is_generating = False
 
@@ -357,13 +567,30 @@ class SessionOrchestrator:
     async def terminate_session(self, session_id: str, reason: str) -> SessionSummary:
         session = await self.load_session(session_id)
         messages = await self.message_store.load_messages(session_id)
-        summary_text = self.strategy_registry.get(session.mode).build_summary(session, messages, reason)
-        if len(messages) < 2:
-            summary_text = f"会话因 {reason} 结束，消息不足，未生成详细摘要。"
+        summary_text = self._build_session_summary_text(session, messages, reason)
         await init_db(self.db_path)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("UPDATE collaboration_sessions SET status = ?, updated_at = ? WHERE id = ?", (SessionStatus.ENDED.value, int(time.time()), session.id))
             await db.commit()
+        return SessionSummary(session.id, reason, summary_text)
+
+    async def delete_session(self, session_id: str, reason: str = "user_deleted") -> SessionSummary:
+        session = await self.load_session(session_id)
+        messages = await self.message_store.load_messages(session_id)
+        summary_text = self._build_session_summary_text(session, messages, reason)
+
+        await init_db(self.db_path)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA foreign_keys=ON;")
+            await db.execute("DELETE FROM model_participants WHERE session_id = ?", (session_id,))
+            await db.execute("DELETE FROM collaboration_messages WHERE session_id = ?", (session_id,))
+            await db.execute("DELETE FROM compressed_summaries WHERE session_id = ?", (session_id,))
+            await db.execute("DELETE FROM checkpoints WHERE session_id = ?", (session_id,))
+            await db.execute("DELETE FROM collaboration_sessions WHERE id = ?", (session_id,))
+            await db.commit()
+
+        self._session_runtime.pop(session_id, None)
+        self._session_locks.pop(session_id, None)
         return SessionSummary(session.id, reason, summary_text)
 
     def _resolve_custom_ids(self, inputs: List[ParticipantInput]) -> List[ParticipantInput]:
@@ -377,6 +604,17 @@ class SessionOrchestrator:
             seen.add(custom_id)
             resolved.append(ParticipantInput(item.model_ref, item.provider_id, custom_id, item.role_desc))
         return resolved
+
+    def _build_session_summary_text(
+        self,
+        session: Session,
+        messages: List[CollaborationMessage],
+        reason: str,
+    ) -> str:
+        summary_text = self.strategy_registry.get(session.mode).build_summary(session, messages, reason)
+        if len(messages) < 2:
+            summary_text = f"会话因 {reason} 结束，消息不足，未生成详细摘要。"
+        return summary_text
 
     async def _persist_session(self, session: Session) -> None:
         await init_db(self.db_path)
@@ -396,7 +634,63 @@ class SessionOrchestrator:
             await db.commit()
 
     def _serialize_session_config(self, session: Session) -> str:
-        return json.dumps({"max_rounds": session.config.max_rounds, "drift_threshold": session.config.drift_threshold, "retention_window": session.config.retention_window, "context_threshold": session.config.context_threshold, "summary_model": session.config.summary_model, "delegate_all_tools": session.config.delegate_all_tools, "current_round": session.current_round, "next_speaker_index": session.next_speaker_index, "snapshot_override": {"topic": session.snapshot.topic, "mode": session.snapshot.mode.value if hasattr(session.snapshot.mode, "value") else str(session.snapshot.mode), "participant_summaries": session.snapshot.participant_summaries, "consensus_list": session.snapshot.consensus_list, "key_events": session.snapshot.key_events}}, ensure_ascii=False)
+        payload: Dict[str, object] = {
+            "max_rounds": session.config.max_rounds,
+            "drift_threshold": session.config.drift_threshold,
+            "retention_window": session.config.retention_window,
+            "context_threshold": session.config.context_threshold,
+            "summary_model": session.config.summary_model,
+            "delegate_all_tools": session.config.delegate_all_tools,
+            "display_title": session.config.display_title or session.topic,
+            "current_round": session.current_round,
+            "next_speaker_index": session.next_speaker_index,
+            "snapshot_override": {
+                "topic": session.snapshot.topic,
+                "mode": session.snapshot.mode.value if hasattr(session.snapshot.mode, "value") else str(session.snapshot.mode),
+                "participant_summaries": session.snapshot.participant_summaries,
+                "consensus_list": session.snapshot.consensus_list,
+                "key_events": session.snapshot.key_events,
+            },
+        }
+        workspace = self._serialize_workspace_config(session.config.workspace)
+        if workspace is not None:
+            payload["workspace"] = workspace
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _serialize_workspace_config(self, workspace: Optional[WorkspaceConfig]) -> Optional[Dict[str, object]]:
+        if workspace is None:
+            return None
+        return {
+            "root_path": workspace.root_path,
+            "display_name": workspace.display_name,
+            "repo_fingerprint": workspace.repo_fingerprint,
+            "scan_excludes": list(workspace.scan_excludes),
+            "selected_paths": list(workspace.selected_paths),
+            "index_status": workspace.index_status,
+            "last_scanned_at": workspace.last_scanned_at,
+            "summary": workspace.summary,
+            "capabilities": workspace_capabilities_to_dict(workspace.capabilities),
+        }
+
+    def _deserialize_workspace_config(self, workspace: object) -> Optional[WorkspaceConfig]:
+        if not isinstance(workspace, dict):
+            return None
+        root_path = str(workspace.get("root_path") or "").strip()
+        if not root_path:
+            return None
+        scan_excludes = workspace.get("scan_excludes")
+        selected_paths = workspace.get("selected_paths")
+        return WorkspaceConfig(
+            root_path=root_path,
+            display_name=str(workspace["display_name"]).strip() if isinstance(workspace.get("display_name"), str) and str(workspace.get("display_name")).strip() else None,
+            repo_fingerprint=str(workspace["repo_fingerprint"]).strip() if isinstance(workspace.get("repo_fingerprint"), str) and str(workspace.get("repo_fingerprint")).strip() else None,
+            scan_excludes=[str(item).strip() for item in scan_excludes if str(item).strip()] if isinstance(scan_excludes, list) else [],
+            selected_paths=[str(item).strip() for item in selected_paths if str(item).strip()] if isinstance(selected_paths, list) else [],
+            index_status=str(workspace.get("index_status") or "pending"),
+            last_scanned_at=int(workspace["last_scanned_at"]) if isinstance(workspace.get("last_scanned_at"), (int, float)) else None,
+            summary=str(workspace["summary"]).strip() if isinstance(workspace.get("summary"), str) and str(workspace.get("summary")).strip() else None,
+            capabilities=workspace_capabilities_from_dict(workspace.get("capabilities")),
+        )
 
     def _rebuild_snapshot(self, session: Session, messages: List[CollaborationMessage]) -> None:
         session.snapshot = self.snapshot_manager.init_snapshot(session)
@@ -454,6 +748,22 @@ class SessionOrchestrator:
         history = self.message_store.build_message_history(messages, participant)
         if history:
             parts.append(history)
+        return [{"role": "system", "content": system_prompt}, {"role": "user", "content": "\n\n".join(parts)}]
+
+    def _build_workspace_dispatch_messages(
+        self,
+        session: Session,
+        participant: ModelParticipant,
+        messages: List[CollaborationMessage],
+        workspace_scan,
+    ) -> List[Dict[str, str]]:
+        system_prompt = self.strategy_registry.get(session.mode).build_system_prompt(participant, session)
+        parts = [self.anchor_injector.build_anchor(participant, session, include_topic=False)]
+        parts.append(self.snapshot_manager.render_snapshot(session.snapshot, include_topic=False))
+        history = self.message_store.build_message_history(messages, participant)
+        if history:
+            parts.append(history)
+        parts.append(build_workspace_file_context(session, workspace_scan))
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": "\n\n".join(parts)}]
 
     async def _iter_model_stream(
