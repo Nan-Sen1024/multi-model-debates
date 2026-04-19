@@ -181,7 +181,7 @@ multi-model-debates/
 ### 1) 安装后端依赖
 
 ```bash
-cd /mnt/d/game/mycode/devPython/multi-model-debates
+cd ./multi-model-debates
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -190,7 +190,7 @@ pip install -r requirements.txt
 Windows PowerShell：
 
 ```powershell
-cd D:\game\mycode\devPython\multi-model-debates
+cd .\multi-model-debates
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -199,7 +199,7 @@ pip install -r requirements.txt
 ### 2) 启动后端
 
 ```bash
-cd /mnt/d/game/mycode/devPython/multi-model-debates
+cd ./multi-model-debates
 source .venv/bin/activate
 uvicorn backend.api:app --reload --host 127.0.0.1 --port 8000
 ```
@@ -211,7 +211,7 @@ uvicorn backend.api:app --reload --host 127.0.0.1 --port 8000
 ### 3) 安装并启动前端
 
 ```bash
-cd /mnt/d/game/mycode/devPython/multi-model-debates/frontend
+cd ./multi-model-debates/frontend
 npm install
 npm start
 ```
@@ -957,7 +957,7 @@ Kimi 类似：
 ### 后端测试
 
 ```bash
-cd /mnt/d/game/mycode/devPython/multi-model-debates
+cd ./multi-model-debates
 source .venv/bin/activate
 python -m pytest -q
 ```
@@ -965,14 +965,14 @@ python -m pytest -q
 ### 前端测试
 
 ```bash
-cd /mnt/d/game/mycode/devPython/multi-model-debates/frontend
+cd ./multi-model-debates/frontend
 npm test -- --watchAll=false
 ```
 
 ### 前端构建
 
 ```bash
-cd /mnt/d/game/mycode/devPython/multi-model-debates/frontend
+cd ./multi-model-debates/frontend
 npm run build
 ```
 
