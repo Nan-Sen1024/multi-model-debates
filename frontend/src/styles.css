@@ -616,6 +616,59 @@ textarea { resize: vertical; }
   font-family: var(--display);
   font-size: 14px;
 }
+.execution-panel {
+  display: grid;
+  gap: 10px;
+}
+.execution-timeline {
+  display: grid;
+  gap: 10px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.execution-entry {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(34, 27, 22, 0.08);
+  background: rgba(255, 252, 247, 0.82);
+}
+.execution-entry-running {
+  border-color: rgba(176, 77, 30, 0.24);
+  background: rgba(176, 77, 30, 0.06);
+}
+.execution-entry-done {
+  border-color: rgba(15, 109, 95, 0.18);
+  background: rgba(15, 109, 95, 0.06);
+}
+.execution-entry-error {
+  border-color: rgba(159, 34, 34, 0.24);
+  background: rgba(159, 34, 34, 0.06);
+}
+.execution-entry-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.execution-entry-icon {
+  width: 16px;
+  text-align: center;
+  color: var(--primary);
+}
+.execution-entry-detail {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(34, 27, 22, 0.04);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .workspace-path-list {
   display: flex;
   flex-wrap: wrap;

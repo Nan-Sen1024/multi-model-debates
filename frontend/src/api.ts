@@ -269,6 +269,7 @@ export function openSessionStream(
 
   [
     "ping",
+    "turn_start",
     "chunk",
     "agent_plan",
     "tool_call",

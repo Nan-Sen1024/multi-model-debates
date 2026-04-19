@@ -263,6 +263,25 @@ describe("App code workspace mode", () => {
     expect(streamCallback).not.toBeNull();
 
     await act(async () => {
+      streamCallback?.("turn_start", {
+        participant_id: "claude",
+        round: 1,
+        execution_mode: "agent",
+      });
+      streamCallback?.("tool_call", {
+        participant_id: "claude",
+        round: 1,
+        server_name: "filesystem",
+        tool_name: "read_file",
+        arguments: { path: "README.md" },
+      });
+      streamCallback?.("tool_result", {
+        participant_id: "claude",
+        round: 1,
+        server_name: "filesystem",
+        tool_name: "read_file",
+        text: "README 内容",
+      });
       streamCallback?.("chunk", {
         participant_id: "claude",
         content: "正在查看 README",
@@ -279,6 +298,10 @@ describe("App code workspace mode", () => {
     });
 
     expect(container.textContent).toContain("正在查看 README");
+    expect(container.textContent).toContain("执行过程");
+    expect(container.textContent).toContain("claude 开始执行");
+    expect(container.textContent).toContain("filesystem.read_file");
+    expect(container.textContent).toContain("README 内容");
   });
 
   test("allows resizing the session chat and workspace panes", async () => {

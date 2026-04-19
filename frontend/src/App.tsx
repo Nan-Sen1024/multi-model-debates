@@ -59,6 +59,7 @@ import {
   saveComposerDraft,
   saveLastSessionId,
 } from "./sessionPersistence";
+import { ExecutionProgressPanel } from "./ExecutionProgress";
 import { applyStreamEvent, SessionStreamViewState } from "./sessionStream";
 import {
   buildWorkspaceCapabilitiesFromDraft,
@@ -80,6 +81,7 @@ import {
   SessionMessageRecord,
   SessionSnapshot,
   SessionWorkspaceView,
+  ExecutionEventRecord,
   StreamPayload,
   StreamState,
 } from "./types";
@@ -207,6 +209,7 @@ export default function App(): JSX.Element {
     messages: [],
     liveMessage: null,
     streamState: "idle",
+    executionEvents: [],
   });
   const [snapshot, setSnapshot] = useState<SessionSnapshot>(initialSnapshot);
   const [snapshotOpen, setSnapshotOpen] = useState(true);
@@ -296,6 +299,7 @@ export default function App(): JSX.Element {
       messages: history.map(mapStoredMessage),
       liveMessage: null,
       streamState: "idle",
+      executionEvents: [],
     });
     setInput(loadComposerDraft(sessionId));
     setActiveTab(3);
@@ -356,6 +360,7 @@ export default function App(): JSX.Element {
         messages: [],
         liveMessage: null,
         streamState: "idle",
+        executionEvents: [],
       });
       setSnapshot(initialSnapshot);
       setInput("");
@@ -668,6 +673,7 @@ export default function App(): JSX.Element {
             messages: [],
             liveMessage: null,
             streamState: "idle",
+            executionEvents: [],
           });
           setSnapshot(initialSnapshot);
           setHistoryExport("");
@@ -734,6 +740,7 @@ export default function App(): JSX.Element {
         ],
         liveMessage: null,
         streamState: "idle",
+        executionEvents: [],
       });
       setHistoryExport("");
       setInput(loadComposerDraft(created.id));
@@ -948,6 +955,7 @@ export default function App(): JSX.Element {
           sessionList={sessionList}
           workspace={workspaceView}
           messages={visibleMessages}
+          executionEvents={streamView.executionEvents}
           streamState={streamView.streamState}
           onSetStreamState={(nextState) =>
             setStreamView((current) => ({ ...current, streamState: nextState }))
@@ -1717,6 +1725,7 @@ interface TabSessionDetailProps {
   sessionList: SessionListItem[];
   workspace: SessionWorkspaceView | null;
   messages: ChatMessage[];
+  executionEvents: ExecutionEventRecord[];
   streamState: StreamState;
   onSetStreamState: (state: StreamState) => void;
   autoStartToken: number;
@@ -1737,7 +1746,7 @@ interface TabSessionDetailProps {
 }
 
 function TabSessionDetail({
-  session, sessionList, workspace, messages, streamState, onSetStreamState, autoStartToken, snapshot, setSnapshot, snapshotOpen, setSnapshotOpen,
+  session, sessionList, workspace, messages, executionEvents, streamState, onSetStreamState, autoStartToken, snapshot, setSnapshot, snapshotOpen, setSnapshotOpen,
   historyExport, input, setInput,
   onSendMessage, onSelectSession, onRenameSession, onDeleteSession,
   onSaveSnapshot, onExportHistory, onStreamEvent,
@@ -2055,6 +2064,11 @@ function TabSessionDetail({
               {snapshotOpen ? "收起" : "展开"}
             </button>
           </div>
+
+          <ExecutionProgressPanel
+            entries={executionEvents}
+            streamState={streamState}
+          />
 
           {session?.mode === "code_workspace" && (
             <WorkspaceSessionPanel

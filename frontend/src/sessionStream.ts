@@ -1,9 +1,10 @@
-import { ChatMessage, StreamPayload, StreamState } from "./types";
+import { ChatMessage, ExecutionEventRecord, StreamPayload, StreamState } from "./types";
 
 export interface SessionStreamViewState {
   messages: ChatMessage[];
   liveMessage: ChatMessage | null;
   streamState: StreamState;
+  executionEvents: ExecutionEventRecord[];
 }
 
 function finalizeLiveMessage(liveMessage: ChatMessage | null): ChatMessage[] {
@@ -28,6 +29,25 @@ function systemStreamMessage(
   };
 }
 
+function executionEvent(
+  event: ExecutionEventRecord["event"],
+  summary: string,
+  round: number,
+  status: ExecutionEventRecord["status"],
+  participantId?: string,
+  detail?: string,
+): ExecutionEventRecord {
+  return {
+    id: `${event}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    event,
+    participantId,
+    round,
+    summary,
+    detail,
+    status,
+  };
+}
+
 export function applyStreamEvent(
   state: SessionStreamViewState,
   eventName: string,
@@ -35,6 +55,26 @@ export function applyStreamEvent(
 ): SessionStreamViewState {
   if (eventName === "ping") {
     return state;
+  }
+
+  if (eventName === "turn_start") {
+    const executionMode =
+      payload.execution_mode === "agent" ? "Agent" : "Model";
+    return {
+      ...state,
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "turn_start",
+          `${payload.participant_id || "Unknown"} 开始执行`,
+          payload.round || 0,
+          "running",
+          payload.participant_id,
+          `${executionMode} · Round ${payload.round || 0}`,
+        ),
+      ],
+      streamState: "streaming",
+    };
   }
 
   if (eventName === "chunk") {
@@ -73,6 +113,16 @@ export function applyStreamEvent(
       messages: [...state.messages, ...finalizeLiveMessage(state.liveMessage)],
       liveMessage: null,
       streamState: "streaming",
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "turn_end",
+          `${payload.participant_id || "Unknown"} 执行完成`,
+          payload.round || 0,
+          "done",
+          payload.participant_id,
+        ),
+      ],
     };
   }
 
@@ -80,6 +130,15 @@ export function applyStreamEvent(
     return {
       ...state,
       streamState: "completed",
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "round_end",
+          `第 ${payload.round || 0} 轮完成`,
+          payload.round || 0,
+          "done",
+        ),
+      ],
     };
   }
 
@@ -99,6 +158,17 @@ export function applyStreamEvent(
       ],
       liveMessage: null,
       streamState: "completed",
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "session_end",
+          "会话结束",
+          payload.round || 0,
+          "done",
+          payload.participant_id,
+          payload.summary || payload.reason || "",
+        ),
+      ],
     };
   }
 
@@ -117,6 +187,17 @@ export function applyStreamEvent(
       ],
       liveMessage: null,
       streamState: "failed",
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "error",
+          payload.message || "调度异常",
+          payload.round || 0,
+          "error",
+          payload.participant_id,
+          payload.code,
+        ),
+      ],
     };
   }
 
@@ -129,6 +210,17 @@ export function applyStreamEvent(
           `agent-plan-${Date.now()}`,
           `[Agent 计划] ${payload.participant_id || "Unknown"}\n${payload.content || ""}`,
           payload.round || 0,
+        ),
+      ],
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "agent_plan",
+          `${payload.participant_id || "Unknown"} 产出执行计划`,
+          payload.round || 0,
+          "info",
+          payload.participant_id,
+          payload.content || "",
         ),
       ],
       streamState: "streaming",
@@ -151,6 +243,17 @@ export function applyStreamEvent(
           payload.round || 0,
         ),
       ],
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "tool_call",
+          `${payload.participant_id || "Unknown"} 调用 ${toolTarget || "unknown"}`,
+          payload.round || 0,
+          "running",
+          payload.participant_id,
+          argumentsText.trim() || undefined,
+        ),
+      ],
       streamState: "streaming",
     };
   }
@@ -165,6 +268,17 @@ export function applyStreamEvent(
           `tool-result-${Date.now()}`,
           `[工具结果] ${toolTarget || "unknown"}\n${payload.text || payload.content || ""}`,
           payload.round || 0,
+        ),
+      ],
+      executionEvents: [
+        ...state.executionEvents,
+        executionEvent(
+          "tool_result",
+          `${toolTarget || "unknown"} 返回结果`,
+          payload.round || 0,
+          "done",
+          payload.participant_id,
+          payload.text || payload.content || "",
         ),
       ],
       streamState: "streaming",

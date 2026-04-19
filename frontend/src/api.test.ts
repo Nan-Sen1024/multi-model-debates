@@ -172,6 +172,31 @@ describe("openSessionStream", () => {
     ]);
   });
 
+  test("forwards turn_start events", () => {
+    const received: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    openSessionStream("session-5", (event, payload) => {
+      received.push({ event, payload: payload as Record<string, unknown> });
+    });
+
+    MockEventSource.instances[0].emit("turn_start", {
+      participant_id: "claude",
+      round: 2,
+      execution_mode: "agent",
+    });
+
+    expect(received).toEqual([
+      {
+        event: "turn_start",
+        payload: {
+          participant_id: "claude",
+          round: 2,
+          execution_mode: "agent",
+        },
+      },
+    ]);
+  });
+
   test("bypasses the CRA dev proxy for SSE in local development", () => {
     openSessionStream("session-dev", () => {});
 

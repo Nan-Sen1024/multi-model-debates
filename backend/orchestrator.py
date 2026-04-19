@@ -375,6 +375,12 @@ class SessionOrchestrator:
                 renderable_messages = await self.message_store.load_renderable_messages(session_id)
                 prompt_messages = self._build_dispatch_messages(session, participant, renderable_messages, runtime.manual_topic_reminder, strategy.build_system_prompt(participant, session))
                 runtime.manual_topic_reminder = False
+                yield StreamChunk(
+                    "turn_start",
+                    participant_id=participant.custom_id,
+                    round_number=session.current_round,
+                    metadata={"execution_mode": "stream"},
+                )
                 try:
                     async for chunk in self._iter_model_stream(participant, prompt_messages):
                         full_content += chunk
@@ -496,6 +502,17 @@ class SessionOrchestrator:
                     agent_profile = resolve_workspace_agent_profile(
                         session.config.workspace.capabilities if session.config.workspace else None,
                         participant.custom_id,
+                    )
+                    execution_mode = (
+                        "agent"
+                        if agent_profile is not None and agent_profile.mode not in {"disabled", "none"}
+                        else "stream"
+                    )
+                    yield StreamChunk(
+                        "turn_start",
+                        participant_id=participant.custom_id,
+                        round_number=session.current_round,
+                        metadata={"execution_mode": execution_mode},
                     )
                     if agent_profile is not None and agent_profile.mode not in {"disabled", "none"}:
                         try:

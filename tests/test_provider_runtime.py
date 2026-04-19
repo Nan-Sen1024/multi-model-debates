@@ -153,8 +153,10 @@ def test_dispatch_round_runs_every_participant_before_round_end(tmp_path):
         "anthropic/claude-3-5-sonnet",
     ]
     assert [(event.event, event.participant_id) for event in events] == [
+        ("turn_start", "A"),
         ("chunk", "A"),
         ("turn_end", "A"),
+        ("turn_start", "B"),
         ("chunk", "B"),
         ("turn_end", "B"),
         ("round_end", None),

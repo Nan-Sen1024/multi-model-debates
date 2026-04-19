@@ -18,6 +18,7 @@ export type CollaborationMode =
 
 export type StreamEventType =
   | "ping"
+  | "turn_start"
   | "chunk"
   | "agent_plan"
   | "tool_call"
@@ -148,6 +149,16 @@ export interface ChatMessage {
   status?: "streaming" | "done" | "warning" | "error";
 }
 
+export interface ExecutionEventRecord {
+  id: string;
+  event: Exclude<StreamEventType, "ping" | "chunk" | "compression" | "drift_alert">;
+  participantId?: string;
+  round: number;
+  summary: string;
+  detail?: string;
+  status: "running" | "done" | "error" | "info";
+}
+
 export interface SkillSourceConfig {
   path: string;
   source_type: string;
@@ -193,6 +204,7 @@ export interface StreamPayload {
   participant_id?: string;
   content?: string;
   round?: number;
+  execution_mode?: string;
   score?: number;
   action?: string;
   masked_count?: number;

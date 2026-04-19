@@ -1,13 +1,19 @@
 import { applyStreamEvent } from "./sessionStream";
 
 describe("applyStreamEvent agent events", () => {
-  test("renders agent plan, tool call, and tool result as system messages", () => {
+  test("tracks agent execution events alongside system messages", () => {
     let state = {
       messages: [],
       liveMessage: null,
       streamState: "idle" as const,
+      executionEvents: [],
     };
 
+    state = applyStreamEvent(state, "turn_start", {
+      participant_id: "claude",
+      round: 1,
+      execution_mode: "agent",
+    });
     state = applyStreamEvent(state, "agent_plan", {
       participant_id: "claude",
       content: "先查看 README，再调用工具。",
@@ -44,5 +50,24 @@ describe("applyStreamEvent agent events", () => {
       type: "system",
       content: expect.stringContaining("README content"),
     });
+    expect(state.executionEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: "turn_start",
+          participantId: "claude",
+          summary: expect.stringContaining("开始执行"),
+        }),
+        expect.objectContaining({
+          event: "tool_call",
+          participantId: "claude",
+          summary: expect.stringContaining("filesystem.read_file"),
+        }),
+        expect.objectContaining({
+          event: "tool_result",
+          participantId: "claude",
+          detail: expect.stringContaining("README content"),
+        }),
+      ]),
+    );
   });
 });
