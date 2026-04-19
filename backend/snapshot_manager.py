@@ -92,7 +92,11 @@ class SnapshotManager:
         """
         session.snapshot.consensus_list.append(consensus)
 
-    def render_snapshot(self, snapshot: SessionSnapshot) -> str:
+    def render_snapshot(
+        self,
+        snapshot: SessionSnapshot,
+        include_topic: bool = True,
+    ) -> str:
         """
         将 Session_Snapshot 渲染为字符串，附加在 Context_Anchor 之后传递给模型。
         需求：25.2
@@ -109,7 +113,8 @@ class SnapshotManager:
             [快照结束]
         """
         lines = ["[会话快照]"]
-        lines.append(f"话题：{snapshot.topic}")
+        if include_topic:
+            lines.append(f"话题：{snapshot.topic}")
 
         # mode 可能是枚举或字符串
         mode_str = snapshot.mode.value if hasattr(snapshot.mode, "value") else str(snapshot.mode)

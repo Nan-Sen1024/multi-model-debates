@@ -8,6 +8,7 @@ export const MODE_OPTIONS: Array<{
   { value: "chat", label: "自由聊天", blurb: "顺序接力式多模型对话" },
   { value: "brainstorm", label: "头脑风暴", blurb: "并行生成创意，再汇总" },
   { value: "code_collaboration", label: "代码协作", blurb: "多角度审查与改进建议" },
+  { value: "code_workspace", label: "代码工作区", blurb: "本地仓库 + @alias 开发流" },
   { value: "data_analysis", label: "数据分析", blurb: "结构化发现、风险与建议" },
   { value: "debate", label: "辩论", blurb: "立场交锋，支持共识检测" },
   { value: "werewolf", label: "狼人杀", blurb: "私有身份、阶段推进、胜负判定" },

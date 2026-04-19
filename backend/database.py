@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     accounts_json   TEXT,                   -- AWS: 可用账号列表 JSON
     selected_account_id   TEXT,
     selected_role_name    TEXT,
+    context_json    TEXT,                   -- 持久化交互式认证上下文（PKCE/device flow）
     error_message   TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
@@ -189,6 +190,12 @@ async def _ensure_compatible_schema(db: aiosqlite.Connection) -> None:
         table_name="model_participants",
         column_name="provider_id",
         ddl="ALTER TABLE model_participants ADD COLUMN provider_id TEXT",
+    )
+    await _ensure_column(
+        db,
+        table_name="auth_sessions",
+        column_name="context_json",
+        ddl="ALTER TABLE auth_sessions ADD COLUMN context_json TEXT",
     )
 
 

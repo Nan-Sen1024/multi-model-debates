@@ -10,7 +10,8 @@ import os
 import tempfile
 import time
 import uuid
-from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlparse
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from backend.auth_flow import (
     FLOW_GENERIC_OAUTH,
     FLOW_OPENAI_CODEX,
     STATUS_AWAITING_ROLE,
+    STATUS_CANCELLED,
     STATUS_COMPLETED,
     STATUS_EXPIRED,
     STATUS_FAILED,
@@ -26,7 +28,9 @@ from backend.auth_flow import (
     AuthFlowManager,
 )
 from backend.database import init_db
-from backend.llm_gateway import _obfuscate
+from backend.llm_gateway import _obfuscate, serialize_auth_config
+from backend.models import AuthConfig, OAuthToken
+from backend.enums import AuthType
 
 
 def run(coro):
@@ -393,6 +397,274 @@ class TestOAuthFlow:
         finally:
             os.unlink(db_path)
 
+    def test_start_openai_codex_flow_falls_back_to_browser_pkce_on_403(self):
+        """device code 未启用时，应回退到浏览器 PKCE 登录而不是直接失败。"""
+        db_path = tmp_db()
+        try:
+            provider_id = run(_insert_provider(db_path))
+            manager = make_manager(db_path)
+
+            mock_discovery = {
+                "device_authorization_endpoint": "https://auth0.openai.com/oauth/device/code",
+                "token_endpoint": "https://auth.openai.com/oauth/token",
+            }
+
+            import httpx as _httpx
+
+            def fake_get(url, **kwargs):
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.json.return_value = mock_discovery
+                resp.raise_for_status = MagicMock()
+                return resp
+
+            def fake_post(url, **kwargs):
+                request = _httpx.Request("POST", url)
+                response = _httpx.Response(403, request=request)
+                raise _httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
+
+            fallback_result = type("FlowResult", (), {
+                "auth_session_id": "pkce-session",
+                "verification_uri": "https://auth.openai.com/oauth/authorize?client_id=test",
+                "user_code": "请在浏览器登录...",
+                "expires_in": 900,
+                "interval": 2,
+                "flow_type": FLOW_OPENAI_CODEX,
+            })()
+            fallback = AsyncMock(return_value=fallback_result)
+
+            with patch("httpx.get", side_effect=fake_get), \
+                 patch("httpx.post", side_effect=fake_post), \
+                 patch.object(manager, "_start_openai_pkce_flow", side_effect=fallback):
+                result = run(manager.start_flow(
+                    provider_id=provider_id,
+                    flow_type=FLOW_OPENAI_CODEX,
+                ))
+
+            assert result.auth_session_id == "pkce-session"
+            assert "oauth/authorize" in result.verification_uri
+            fallback.assert_called_once_with(provider_id)
+        finally:
+            os.unlink(db_path)
+
+    def test_start_openai_pkce_flow_matches_current_codex_cli_params(self):
+        """浏览器登录默认参数应与本机官方 Codex CLI 当前版本保持一致。"""
+        db_path = tmp_db()
+        try:
+            provider_id = run(_insert_provider(db_path))
+            manager = make_manager(db_path)
+
+            result = run(manager.start_flow(
+                provider_id=provider_id,
+                flow_type=FLOW_OPENAI_CODEX,
+                login_variant="browser",
+            ))
+
+            query = parse_qs(urlparse(result.verification_uri).query)
+
+            assert query["client_id"] == ["app_EMoamEEZ73f0CkXaXp7hrann"]
+            assert query["redirect_uri"] == ["http://localhost:1455/auth/callback"]
+            assert query["scope"] == ["openid profile email offline_access"]
+            assert query["id_token_add_organizations"] == ["true"]
+            assert query["codex_cli_simplified_flow"] == ["true"]
+            assert query["originator"] == ["codex_cli_rs"]
+            assert "api.connectors.read" not in query["scope"][0]
+            assert "api.connectors.invoke" not in query["scope"][0]
+        finally:
+            os.unlink(db_path)
+
+    def test_start_openai_pkce_flow_uses_windows_bridge_under_wsl(self):
+        """WSL 中应启动 Windows localhost 桥接，而不是只在 Linux 侧监听 1455。"""
+        db_path = tmp_db()
+        try:
+            provider_id = run(_insert_provider(db_path))
+            manager = make_manager(db_path)
+            created = []
+
+            class _FakeTask:
+                def add_done_callback(self, callback):
+                    return None
+
+            def fake_create_task(coro):
+                created.append(coro.cr_code.co_name)
+                coro.close()
+                return _FakeTask()
+
+            with patch("backend.auth_flow._should_use_windows_loopback_bridge", return_value=True), \
+                 patch("backend.auth_flow.asyncio.create_task", side_effect=fake_create_task):
+                run(manager.start_flow(
+                    provider_id=provider_id,
+                    flow_type=FLOW_OPENAI_CODEX,
+                    login_variant="browser",
+                ))
+
+            assert created == ["_spawn_windows_callback_bridge"]
+        finally:
+            os.unlink(db_path)
+
+    def test_handle_interactive_callback_completes_openai_codex_browser_flow(self):
+        """Codex 浏览器登录回调应走后端 callback 完成 token 交换。"""
+        import aiosqlite
+
+        db_path = tmp_db()
+        try:
+            provider_id = run(_insert_provider(db_path))
+            manager = make_manager(db_path)
+            auth_session_id = str(uuid.uuid4())
+            now = int(time.time())
+            context_json = json.dumps(
+                {
+                    "provider_id": provider_id,
+                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "token_endpoint": "https://auth.openai.com/oauth/token",
+                    "redirect_uri": "http://localhost:1455/auth/callback",
+                    "code_verifier": "verifier-123",
+                },
+                ensure_ascii=False,
+            )
+
+            async def _insert_session():
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        """INSERT INTO auth_sessions
+                           (id, provider_id, flow_type, status, verification_uri, user_code,
+                            interval, expires_at, context_json, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            auth_session_id,
+                            provider_id,
+                            FLOW_OPENAI_CODEX,
+                            STATUS_PENDING,
+                            "https://auth.openai.com/oauth/authorize?state=test",
+                            "请在浏览器登录...",
+                            2,
+                            now + 900,
+                            context_json,
+                            now,
+                            now,
+                        ),
+                    )
+                    await db.commit()
+
+            run(_insert_session())
+
+            mock_token_resp = MagicMock()
+            mock_token_resp.status_code = 200
+            mock_token_resp.json.return_value = {
+                "access_token": "access-token-xyz",
+                "refresh_token": "refresh-token-abc",
+                "expires_in": 3600,
+            }
+            mock_token_resp.raise_for_status = MagicMock()
+
+            with patch("httpx.post", return_value=mock_token_resp) as mock_post:
+                run(manager.handle_interactive_callback(auth_session_id, "code-123"))
+
+            mock_post.assert_called_once_with(
+                "https://auth.openai.com/oauth/token",
+                json={
+                    "grant_type": "authorization_code",
+                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "code": "code-123",
+                    "redirect_uri": "http://localhost:1455/auth/callback",
+                    "code_verifier": "verifier-123",
+                },
+                timeout=15,
+            )
+
+            status = run(manager.get_status(auth_session_id))
+            assert status.status == STATUS_COMPLETED
+
+            async def _check_provider():
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute(
+                        "SELECT auth_type, auth_config FROM provider_configs WHERE id = ?",
+                        (provider_id,),
+                    ) as cur:
+                        return await cur.fetchone()
+
+            row = run(_check_provider())
+            assert row["auth_type"] == AuthType.OAUTH.value
+            auth_config = json.loads(row["auth_config"])
+            assert auth_config["oauth_token"]["access_token"]
+        finally:
+            os.unlink(db_path)
+
+    def test_handle_interactive_callback_retries_direct_when_proxy_path_refused(self):
+        """Codex token exchange 首次连接失败时应绕过环境代理重试直连。"""
+        import aiosqlite
+        import httpx
+
+        db_path = tmp_db()
+        try:
+            provider_id = run(_insert_provider(db_path))
+            manager = make_manager(db_path)
+            auth_session_id = str(uuid.uuid4())
+            now = int(time.time())
+            context_json = json.dumps(
+                {
+                    "provider_id": provider_id,
+                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "token_endpoint": "https://auth.openai.com/oauth/token",
+                    "redirect_uri": "http://localhost:1455/auth/callback",
+                    "code_verifier": "verifier-123",
+                },
+                ensure_ascii=False,
+            )
+
+            async def _insert_session():
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        """INSERT INTO auth_sessions
+                           (id, provider_id, flow_type, status, verification_uri, user_code,
+                            interval, expires_at, context_json, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            auth_session_id,
+                            provider_id,
+                            FLOW_OPENAI_CODEX,
+                            STATUS_PENDING,
+                            "https://auth.openai.com/oauth/authorize?state=test",
+                            "请在浏览器登录...",
+                            2,
+                            now + 900,
+                            context_json,
+                            now,
+                            now,
+                        ),
+                    )
+                    await db.commit()
+
+            run(_insert_session())
+
+            request = httpx.Request("POST", "https://auth.openai.com/oauth/token")
+            connect_error = httpx.ConnectError("[Errno 111] Connection refused", request=request)
+            success = MagicMock()
+            success.status_code = 200
+            success.json.return_value = {
+                "access_token": "access-token-xyz",
+                "refresh_token": "refresh-token-abc",
+                "expires_in": 3600,
+            }
+            success.raise_for_status = MagicMock()
+
+            with patch("httpx.post", side_effect=[connect_error, success]) as mock_post:
+                run(manager.handle_interactive_callback(auth_session_id, "code-123"))
+
+            assert mock_post.call_count == 2
+            first_call = mock_post.call_args_list[0]
+            second_call = mock_post.call_args_list[1]
+            assert first_call.kwargs["timeout"] == 15
+            assert "trust_env" not in first_call.kwargs
+            assert second_call.kwargs["timeout"] == 15
+            assert second_call.kwargs["trust_env"] is False
+
+            status = run(manager.get_status(auth_session_id))
+            assert status.status == STATUS_COMPLETED
+        finally:
+            os.unlink(db_path)
+
     def test_oauth_poll_completes_and_writes_token(self):
         """轮询完成后，provider_configs.auth_config 应包含 OAuth token。"""
         import aiosqlite
@@ -615,5 +887,121 @@ def test_update_auth_session_expired():
         status = run(manager.get_status(auth_session_id))
         assert status.status == STATUS_EXPIRED
         assert status.error_message == "timed out"
+    finally:
+        os.unlink(db_path)
+
+
+def test_cancel_pending_auth_flow_marks_cancelled_and_stops_task():
+    db_path = tmp_db()
+    try:
+        provider_id = run(_insert_provider(db_path))
+        manager = make_manager(db_path)
+        auth_session_id = str(uuid.uuid4())
+        now = int(time.time())
+
+        async def _insert():
+            import aiosqlite
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute(
+                    """INSERT INTO auth_sessions
+                       (id, provider_id, flow_type, status, verification_uri, user_code,
+                        device_code, client_id, client_secret, interval, expires_at,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        auth_session_id, provider_id, FLOW_GENERIC_OAUTH, STATUS_PENDING,
+                        "https://v.example.com", "AB", _obfuscate("dc"),
+                        "cid", _obfuscate(""), 5, now + 300, now, now,
+                    ),
+                )
+                await db.commit()
+
+        run(_insert())
+
+        loop = asyncio.new_event_loop()
+        try:
+            task = loop.create_task(asyncio.sleep(300))
+            manager._poll_tasks[auth_session_id] = task
+            loop.run_until_complete(manager.cancel_flow(auth_session_id))
+            loop.run_until_complete(asyncio.sleep(0))
+            assert task.cancelled()
+        finally:
+            loop.close()
+
+        status = run(manager.get_status(auth_session_id))
+        assert status.status == STATUS_CANCELLED
+        assert status.error_message == "用户已取消登录"
+    finally:
+        os.unlink(db_path)
+
+
+def test_logout_provider_clears_oauth_token_and_cancels_pending_sessions():
+    db_path = tmp_db()
+    try:
+        provider_id = run(_insert_provider(db_path))
+        manager = make_manager(db_path)
+        auth_session_id = str(uuid.uuid4())
+        now = int(time.time())
+
+        async def _seed():
+            import aiosqlite
+            auth_config = AuthConfig(
+                auth_type=AuthType.OAUTH,
+                oauth_token=OAuthToken(access_token="token-123"),
+                metadata={
+                    "authorization_endpoint": "https://example.com/authorize",
+                    "token_endpoint": "https://example.com/token",
+                    "client_id": "client-123",
+                },
+            )
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute(
+                    "UPDATE provider_configs SET auth_type = ?, auth_config = ? WHERE id = ?",
+                    (
+                        AuthType.OAUTH.value,
+                        json.dumps(serialize_auth_config(auth_config), ensure_ascii=False),
+                        provider_id,
+                    ),
+                )
+                await db.execute(
+                    """INSERT INTO auth_sessions
+                       (id, provider_id, flow_type, status, verification_uri, user_code,
+                        device_code, client_id, client_secret, interval, expires_at,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        auth_session_id, provider_id, FLOW_GENERIC_OAUTH, STATUS_PENDING,
+                        "https://v.example.com", "AB", _obfuscate("dc"),
+                        "cid", _obfuscate(""), 5, now + 300, now, now,
+                    ),
+                )
+                await db.commit()
+
+        run(_seed())
+        run(manager.logout_provider(provider_id))
+
+        async def _check():
+            import aiosqlite
+            async with aiosqlite.connect(db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT auth_type, auth_config FROM provider_configs WHERE id = ?",
+                    (provider_id,),
+                ) as cur:
+                    provider_row = await cur.fetchone()
+                async with db.execute(
+                    "SELECT status, error_message FROM auth_sessions WHERE id = ?",
+                    (auth_session_id,),
+                ) as cur:
+                    auth_row = await cur.fetchone()
+                return provider_row, auth_row
+
+        provider_row, auth_row = run(_check())
+        provider_auth = json.loads(provider_row["auth_config"])
+        assert provider_row["auth_type"] == AuthType.OAUTH.value
+        assert "oauth_token" not in provider_auth
+        assert provider_auth["metadata"]["client_id"] == "client-123"
+        assert auth_row["status"] == STATUS_CANCELLED
+        assert auth_row["error_message"] == "用户已退出登录"
     finally:
         os.unlink(db_path)

@@ -104,6 +104,46 @@ class MessageStore:
 
         return messages
 
+    async def load_renderable_messages(self, session_id: str) -> List[CollaborationMessage]:
+        """
+        加载用于 prompt/history 渲染的消息序列。
+
+        如果某段消息已经被写入 compressed_summaries，则用一条合成的摘要消息替代
+        该压缩区间内的原始消息，避免继续把原文发送给模型。
+        """
+        messages = await self.load_messages(session_id)
+        summaries = await self._load_compressed_summaries(session_id)
+        if not messages or not summaries:
+            return messages
+
+        renderable: List[CollaborationMessage] = []
+        summary_index = 0
+        message_index = 0
+
+        while message_index < len(messages):
+            message = messages[message_index]
+            summary = summaries[summary_index] if summary_index < len(summaries) else None
+
+            if (
+                summary is not None
+                and message.is_compressed
+                and message.round_number >= summary["covers_from"]
+            ):
+                renderable.append(summary["message"])
+                while (
+                    message_index < len(messages)
+                    and messages[message_index].is_compressed
+                    and messages[message_index].round_number <= summary["covers_to"]
+                ):
+                    message_index += 1
+                summary_index += 1
+                continue
+
+            renderable.append(message)
+            message_index += 1
+
+        return renderable
+
     async def update_drift_score(self, message_id: str, drift_score: float) -> None:
         """更新指定消息的漂移分数。"""
         await init_db(self.db_path)
@@ -149,3 +189,42 @@ class MessageStore:
                 lines.append(f"[{msg.sender_id}|{msg_type}]: {msg.content}")
 
         return "\n".join(lines)
+
+    async def _load_compressed_summaries(self, session_id: str) -> List[dict]:
+        await init_db(self.db_path)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, session_id, covers_from, covers_to, summary_text, created_at
+                FROM compressed_summaries
+                WHERE session_id = ?
+                ORDER BY covers_from ASC, covers_to ASC, created_at ASC
+                """,
+                (session_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        summaries: List[dict] = []
+        for row in rows:
+            from datetime import datetime, timezone
+
+            created_at = datetime.fromtimestamp(row["created_at"], tz=timezone.utc).replace(tzinfo=None)
+            summaries.append(
+                {
+                    "covers_from": row["covers_from"],
+                    "covers_to": row["covers_to"],
+                    "message": CollaborationMessage(
+                        id=row["id"],
+                        session_id=row["session_id"],
+                        sender_id="[历史摘要]",
+                        message_type=MessageType.DIALOGUE,
+                        content=row["summary_text"],
+                        is_compressed=True,
+                        round_number=row["covers_to"],
+                        created_at=created_at,
+                    ),
+                }
+            )
+        return summaries

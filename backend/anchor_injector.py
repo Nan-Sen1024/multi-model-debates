@@ -58,7 +58,12 @@ class AnchorInjector:
 
     MAX_ANCHOR_TOKENS = 512
 
-    def build_anchor(self, participant: ModelParticipant, session: Session) -> str:
+    def build_anchor(
+        self,
+        participant: ModelParticipant,
+        session: Session,
+        include_topic: bool = True,
+    ) -> str:
         """
         为指定参与者构建 Context_Anchor 字符串。
 
@@ -71,7 +76,7 @@ class AnchorInjector:
             private_info = participant.private_info
 
         fields = AnchorFields(
-            topic=session.topic,
+            topic=session.topic if include_topic else "",
             mode=session.mode.value,
             custom_id=participant.custom_id,
             role_desc=participant.role_desc or "",
@@ -109,7 +114,10 @@ class AnchorInjector:
         """
         按固定格式渲染锚点块（需求 21.2）。
         """
-        lines = ["[系统锚点]", f"话题：{f.topic}"]
+        lines = ["[系统锚点]"]
+
+        if f.topic:
+            lines.append(f"话题：{f.topic}")
 
         if f.mode:
             lines.append(f"协作模式：{f.mode}")

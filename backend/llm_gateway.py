@@ -6,9 +6,13 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import subprocess
 import time
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from .enums import APIFormat, AuthType, ProviderType
@@ -64,13 +68,47 @@ def validate_model_ref(model_ref: str) -> Tuple[str, str]:
         )
 
     parts = model_ref.split("/")
-    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+    if len(parts) != 2:
         raise ValidationError(
             f"Invalid Model_Ref '{model_ref}'; expected provider/model",
             field="model_ref",
         )
 
-    return parts[0].strip(), parts[1].strip()
+    provider = parts[0].strip()
+    model = parts[1].strip()
+    if not provider or not model:
+        raise ValidationError(
+            f"Invalid Model_Ref '{model_ref}'; expected provider/model",
+            field="model_ref",
+        )
+
+    return provider, model
+
+
+def resolve_model_target(
+    model_ref: str,
+    provider_config: Optional[ProviderConfig] = None,
+) -> Tuple[str, str]:
+    if provider_config is None:
+        return validate_model_ref(model_ref)
+
+    if not model_ref or not isinstance(model_ref, str):
+        raise ValidationError(
+            "Model_Ref cannot be empty; expected provider/model",
+            field="model_ref",
+        )
+
+    if "/" not in model_ref:
+        model = model_ref.strip()
+        if not model:
+            raise ValidationError(
+                f"Invalid Model_Ref '{model_ref}'; expected provider/model",
+                field="model_ref",
+            )
+        provider_name = (provider_config.name or "").strip() or provider_config.provider_type.value
+        return provider_name, model
+
+    return validate_model_ref(model_ref)
 
 
 async def check_provider_connectivity(provider_config: ProviderConfig) -> bool:
@@ -81,6 +119,126 @@ async def check_provider_connectivity(provider_config: ProviderConfig) -> bool:
 async def discover_ollama_models(base_url: str = "http://127.0.0.1:11434") -> List[str]:
     gateway = LLMGatewayClient()
     return await gateway.get_local_models(base_url)
+
+
+def _normalize_discovery_base_url(base_url: str, provider_type: ProviderType) -> str:
+    normalized = base_url.rstrip("/")
+    if provider_type == ProviderType.OLLAMA:
+        normalized = normalized.removesuffix("/v1")
+    return normalized
+
+
+def _extract_discovered_model_ids(payload: Any) -> List[str]:
+    collected: List[str] = []
+
+    if isinstance(payload, list):
+        for item in payload:
+            collected.extend(_extract_discovered_model_ids(item))
+        return collected
+
+    if isinstance(payload, dict):
+        for key in ("data", "models", "items", "results"):
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                collected.extend(_extract_discovered_model_ids(nested))
+
+        for key in ("id", "name", "model"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized:
+                    collected.append(normalized)
+        return collected
+
+    if isinstance(payload, str):
+        normalized = payload.strip()
+        if normalized:
+            collected.append(normalized)
+
+    return collected
+
+
+def _dedupe_model_ids(model_ids: List[str]) -> List[str]:
+    seen = set()
+    deduped: List[str] = []
+    for model_id in model_ids:
+        normalized = model_id.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+_LITELLM_MODEL_PROVIDER_ALIASES: Dict[ProviderType, Tuple[str, ...]] = {
+    ProviderType.OPENAI: ("openai", "chatgpt"),
+    ProviderType.ANTHROPIC: ("anthropic",),
+    ProviderType.GOOGLE: ("gemini",),
+    ProviderType.GROQ: ("groq",),
+    ProviderType.MISTRAL: ("mistral",),
+    ProviderType.XAI: ("xai",),
+    ProviderType.OLLAMA: ("ollama",),
+    ProviderType.LM_STUDIO: ("lm_studio",),
+    ProviderType.VLLM: ("hosted_vllm", "vllm"),
+    ProviderType.OPENROUTER: ("openrouter",),
+    ProviderType.LITELLM: ("litellm_proxy", "litellm"),
+    ProviderType.GATEWAY: ("litellm_proxy", "litellm"),
+}
+
+_LITELLM_EXTRA_MODEL_ATTRS: Dict[ProviderType, Tuple[str, ...]] = {
+    ProviderType.OPENAI: ("open_ai_chat_completion_models", "chatgpt_models"),
+    ProviderType.ANTHROPIC: ("anthropic_models",),
+    ProviderType.GOOGLE: ("gemini_models",),
+    ProviderType.GROQ: ("groq_models",),
+    ProviderType.XAI: ("xai_models",),
+    ProviderType.OLLAMA: ("ollama_models",),
+    ProviderType.OPENROUTER: ("openrouter_models",),
+}
+
+
+def _normalize_litellm_model_id(model_id: str, provider_aliases: Tuple[str, ...]) -> str:
+    normalized = model_id.strip()
+    if not normalized:
+        return ""
+
+    for alias in provider_aliases:
+        prefix = f"{alias}/"
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):].strip()
+    return normalized
+
+
+def _collect_litellm_model_ids(provider_config: ProviderConfig) -> List[str]:
+    if not _load_litellm() or litellm is None:
+        return []
+
+    provider_aliases = _LITELLM_MODEL_PROVIDER_ALIASES.get(
+        provider_config.provider_type,
+        (provider_config.provider_type.value,),
+    )
+    collected: List[str] = []
+
+    models_by_provider = getattr(litellm, "models_by_provider", None)
+    if isinstance(models_by_provider, dict):
+        for alias in provider_aliases:
+            models = models_by_provider.get(alias)
+            if isinstance(models, (list, tuple, set)):
+                for model in models:
+                    if isinstance(model, str):
+                        normalized = _normalize_litellm_model_id(model, provider_aliases)
+                        if normalized:
+                            collected.append(normalized)
+
+    for attr_name in _LITELLM_EXTRA_MODEL_ATTRS.get(provider_config.provider_type, ()):
+        models = getattr(litellm, attr_name, None)
+        if isinstance(models, (list, tuple, set)):
+            for model in models:
+                if isinstance(model, str):
+                    normalized = _normalize_litellm_model_id(model, provider_aliases)
+                    if normalized:
+                        collected.append(normalized)
+
+    return _dedupe_model_ids(collected)
 
 
 def _obfuscate(value: str) -> str:
@@ -166,7 +324,175 @@ def deserialize_auth_config(auth_type: Any, payload: Optional[Any]) -> AuthConfi
         bearer_token=raw_payload.get("bearer_token"),
         helper_script=raw_payload.get("helper_script"),
         oauth_token=token,
+        metadata=raw_payload.get("metadata")
+        if isinstance(raw_payload.get("metadata"), dict)
+        else {},
     )
+
+
+def _is_chatgpt_oauth_runtime(
+    provider: str,
+    provider_config: Optional[ProviderConfig],
+    auth_config: AuthConfig,
+) -> bool:
+    if auth_config.auth_type != AuthType.OAUTH:
+        return False
+    if auth_config.oauth_token is None or not auth_config.oauth_token.access_token:
+        return False
+    if provider_config is not None:
+        return provider_config.provider_type == ProviderType.OPENAI
+    return provider == ProviderType.OPENAI.value
+
+
+def _normalize_chatgpt_model_name(model: str) -> str:
+    normalized = model.strip()
+    if normalized.startswith("gpt-5.3") and "codex" not in normalized:
+        return "gpt-5.3-codex"
+    return normalized
+
+
+def _build_chatgpt_responses_input(
+    messages: List[Dict[str, str]],
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    instructions: List[str] = []
+    input_items: List[Dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        content = message.get("content")
+
+        if role == "system":
+            if isinstance(content, str):
+                normalized_content = content.strip()
+            elif content is None:
+                normalized_content = ""
+            else:
+                normalized_content = json.dumps(content, ensure_ascii=False)
+            if normalized_content:
+                instructions.append(normalized_content)
+            continue
+
+        if role not in {"user", "assistant", "developer"}:
+            role = "user"
+
+        if content is None:
+            normalized_content = ""
+        elif isinstance(content, str):
+            normalized_content = content
+        else:
+            normalized_content = json.dumps(content, ensure_ascii=False)
+
+        input_items.append(
+            {
+                "type": "message",
+                "role": role,
+                "content": normalized_content,
+            }
+        )
+
+    if not input_items:
+        input_items.append({"type": "message", "role": "user", "content": ""})
+
+    return ("\n\n".join(instructions) if instructions else None, input_items)
+
+
+def _extract_chunk_value(chunk: Any, key: str) -> Any:
+    if isinstance(chunk, dict):
+        return chunk.get(key)
+    return getattr(chunk, key, None)
+
+
+def _extract_chatgpt_completed_text(response: Any) -> Optional[str]:
+    output = _extract_chunk_value(response, "output")
+    if not isinstance(output, list):
+        return None
+
+    texts: List[str] = []
+    for item in output:
+        item_type = _extract_chunk_value(item, "type")
+        if item_type != "message":
+            continue
+        content = _extract_chunk_value(item, "content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            part_type = _extract_chunk_value(part, "type")
+            if part_type not in {"output_text", "text"}:
+                continue
+            text = _extract_chunk_value(part, "text")
+            if isinstance(text, str) and text:
+                texts.append(text)
+
+    combined = "".join(texts)
+    return combined or None
+
+
+def _extract_chatgpt_delta(chunk: Any) -> Optional[str]:
+    event_type = _extract_chunk_value(chunk, "type")
+    if event_type not in {"response.output_text.delta", "response.text.delta"}:
+        return None
+
+    delta = _extract_chunk_value(chunk, "delta")
+    if delta is None:
+        return None
+    if isinstance(delta, str):
+        return delta
+    return str(delta)
+
+
+@contextmanager
+def _chatgpt_auth_bridge(auth_config: AuthConfig):
+    token = auth_config.oauth_token
+    if token is None or not token.access_token:
+        raise AuthenticationError("OAuth token is not configured")
+
+    previous_env = {
+        "CHATGPT_TOKEN_DIR": os.environ.get("CHATGPT_TOKEN_DIR"),
+        "CHATGPT_AUTH_FILE": os.environ.get("CHATGPT_AUTH_FILE"),
+    }
+
+    with tempfile.TemporaryDirectory(prefix="chatgpt-token-") as token_dir:
+        auth_payload: Dict[str, Any] = {"access_token": token.access_token}
+        if token.refresh_token:
+            auth_payload["refresh_token"] = token.refresh_token
+        if token.expires_at is not None:
+            from datetime import timezone
+
+            expires_at = token.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            auth_payload["expires_at"] = int(expires_at.timestamp())
+
+        metadata = auth_config.metadata if isinstance(auth_config.metadata, dict) else {}
+        account_id = None
+        for key in ("account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                account_id = value.strip()
+                break
+            if value is not None:
+                value_str = str(value).strip()
+                if value_str:
+                    account_id = value_str
+                    break
+        if account_id:
+            auth_payload["account_id"] = account_id
+
+        auth_file = Path(token_dir) / "auth.json"
+        auth_file.write_text(json.dumps(auth_payload, ensure_ascii=False), encoding="utf-8")
+
+        os.environ["CHATGPT_TOKEN_DIR"] = token_dir
+        os.environ["CHATGPT_AUTH_FILE"] = "auth.json"
+        try:
+            yield
+        finally:
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 @dataclass
@@ -278,6 +604,72 @@ class SSOOIDCClient:
             )
             response.raise_for_status()
             return response.json().get("accountList", [])
+
+    def register_client_pkce(self, redirect_uri: str) -> Dict[str, Any]:
+        """注册支持 authorization_code + PKCE 的 OIDC 客户端。"""
+        if not _HTTPX_AVAILABLE:
+            raise ProviderUnavailableError("httpx is required for SSO OIDC PKCE registration")
+        with httpx.Client() as client:
+            response = client.post(
+                f"{self._oidc_endpoint()}/client/register",
+                json={
+                    "clientName": "multi-model-debate-pkce",
+                    "clientType": "public",
+                    "scopes": ["sso:account:access"],
+                    "grantTypes": ["authorization_code", "refresh_token"],
+                    "redirectUris": [redirect_uri],
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def build_authorize_url(
+        self,
+        client_id: str,
+        redirect_uri: str,
+        state: str,
+        code_challenge: str,
+    ) -> str:
+        """构造 PKCE 授权 URL，用户在浏览器中打开此 URL 完成 SSO 登录。"""
+        from urllib.parse import urlencode
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": "sso:account:access",
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        return f"{self._oidc_endpoint()}/authorize?" + urlencode(params)
+
+    def exchange_auth_code(
+        self,
+        client_id: str,
+        client_secret: str,
+        code: str,
+        redirect_uri: str,
+        code_verifier: str,
+    ) -> Dict[str, Any]:
+        """用授权码换取 access_token（PKCE flow）。"""
+        if not _HTTPX_AVAILABLE:
+            raise ProviderUnavailableError("httpx is required for auth code exchange")
+        with httpx.Client() as client:
+            response = client.post(
+                f"{self._oidc_endpoint()}/token",
+                json={
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
+                    "grantType": "authorization_code",
+                    "redirectUri": redirect_uri,
+                    "code": code,
+                    "codeVerifier": code_verifier,
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            return response.json()
 
     def list_account_roles(self, access_token: str, account_id: str) -> List[Dict[str, Any]]:
         if not _HTTPX_AVAILABLE:
@@ -437,8 +829,22 @@ class LLMGatewayClient:
         auth_config: Optional[AuthConfig] = None,
         provider_config: Optional[ProviderConfig] = None,
     ) -> AsyncIterator[str]:
-        provider, model = validate_model_ref(model_ref)
+        provider, model = resolve_model_target(model_ref, provider_config=provider_config)
         effective_auth = provider_config.auth_config if provider_config else (auth_config or AuthConfig(auth_type=AuthType.IAM))
+
+        if _is_chatgpt_oauth_runtime(provider, provider_config, effective_auth):
+            if not _load_litellm():
+                raise ProviderUnavailableError("LiteLLM is required for ChatGPT responses streaming", provider=provider_config.name if provider_config else provider)
+            async for chunk in self._chatgpt_responses_stream(
+                provider=provider,
+                model=model,
+                messages=messages,
+                auth_config=effective_auth,
+                provider_config=provider_config,
+            ):
+                yield chunk
+            return
+
         headers = self._auth_manager.get_headers(effective_auth)
 
         if provider_config is not None:
@@ -512,6 +918,111 @@ class LLMGatewayClient:
                 provider=effective_provider,
             ) from exc
 
+    async def _chatgpt_responses_stream(
+        self,
+        provider: str,
+        model: str,
+        messages: List[Dict[str, str]],
+        auth_config: AuthConfig,
+        provider_config: Optional[ProviderConfig] = None,
+    ) -> AsyncIterator[str]:
+        if not _load_litellm():
+            raise ProviderUnavailableError("LiteLLM is unavailable", provider=provider)
+
+        model = _normalize_chatgpt_model_name(model)
+        instructions, input_messages = _build_chatgpt_responses_input(messages)
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "input": input_messages,
+            "stream": True,
+            "store": False,
+            "custom_llm_provider": "chatgpt",
+        }
+        if instructions:
+            kwargs["instructions"] = instructions
+
+        emitted_any = False
+        try:
+            with _chatgpt_auth_bridge(auth_config):
+                response = await litellm.aresponses(**kwargs)  # type: ignore[union-attr]
+                async for chunk in response:
+                    delta = _extract_chatgpt_delta(chunk)
+                    if delta:
+                        emitted_any = True
+                        yield delta
+                        continue
+
+                    event_type = _extract_chunk_value(chunk, "type")
+                    if emitted_any:
+                        continue
+
+                    if event_type in {
+                        "response.output_text.done",
+                        "response.text.done",
+                        "response.completed",
+                    }:
+                        completed_text = _extract_chatgpt_completed_text(
+                            _extract_chunk_value(chunk, "response")
+                            if event_type == "response.completed"
+                            else chunk
+                        )
+                        if completed_text:
+                            emitted_any = True
+                            yield completed_text
+        except Exception as exc:
+            provider_name = provider_config.name if provider_config and provider_config.name else provider
+            detail = str(exc).strip()
+            message = f"LiteLLM ChatGPT responses invocation failed: {type(exc).__name__}"
+            if detail and detail != type(exc).__name__:
+                message = f"{message}: {detail}"
+            raise ProviderUnavailableError(
+                message,
+                provider=provider_name,
+            ) from exc
+
+    async def discover_provider_models(self, provider_config: ProviderConfig) -> List[str]:
+        if not _HTTPX_AVAILABLE:
+            logger.warning("httpx unavailable, cannot discover provider models")
+            return _collect_litellm_model_ids(provider_config)
+
+        base_url = provider_config.base_url or self._get_default_base_url(provider_config.provider_type)
+        normalized_base_url = _normalize_discovery_base_url(base_url, provider_config.provider_type)
+        endpoint = (
+            f"{normalized_base_url}/api/tags"
+            if provider_config.provider_type == ProviderType.OLLAMA
+            else f"{normalized_base_url}/models"
+        )
+
+        try:
+            headers = self._auth_manager.get_headers(provider_config.auth_config)
+        except AuthenticationError:
+            headers = {}
+
+        discovered_models: List[str] = []
+        try:
+            async with httpx.AsyncClient() as client:  # type: ignore[union-attr]
+                response = await client.get(endpoint, headers=headers, timeout=5)
+            if response.status_code != 200:
+                discovered_models = []
+            else:
+                data = response.json()
+                discovered_models = _dedupe_model_ids(_extract_discovered_model_ids(data))
+        except Exception as exc:
+            logger.debug("provider model discovery failed for %s: %s", provider_config.name, exc)
+            discovered_models = []
+
+        if discovered_models:
+            return discovered_models
+
+        fallback_models = _collect_litellm_model_ids(provider_config)
+        if fallback_models:
+            logger.debug(
+                "provider model discovery for %s fell back to LiteLLM registry (%d models)",
+                provider_config.name,
+                len(fallback_models),
+            )
+        return fallback_models
+
     async def _httpx_stream(
         self,
         provider: str,
@@ -581,36 +1092,87 @@ class LLMGatewayClient:
         provider_name: str,
     ) -> AsyncIterator[str]:
         payload = {"model": model, "messages": messages, "stream": True}
-
-        async with httpx.AsyncClient() as client:  # type: ignore[union-attr]
+        try:
+            async for chunk in self._stream_openai_compatible_once(
+                endpoint=endpoint,
+                payload=payload,
+                headers=headers,
+                provider_name=provider_name,
+            ):
+                yield chunk
+            return
+        except httpx.ConnectError as exc:
+            logger.warning(
+                "OpenAI-compatible stream connect failed for %s; retrying direct connection: %s",
+                provider_name,
+                exc,
+            )
             try:
-                async with client.stream(
-                    "POST",
-                    endpoint,
-                    json=payload,
+                async for chunk in self._stream_openai_compatible_once(
+                    endpoint=endpoint,
+                    payload=payload,
                     headers=headers,
-                    timeout=60,
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data = line[6:]
-                        if data.strip() == "[DONE]":
-                            break
-                        try:
-                            payload = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        delta = payload.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content")
-                        if content:
-                            yield content
-            except Exception as exc:
+                    provider_name=provider_name,
+                    trust_env=False,
+                ):
+                    yield chunk
+                return
+            except ProviderUnavailableError:
+                raise
+            except Exception as retry_exc:
                 raise ProviderUnavailableError(
-                    f"httpx invocation failed: {type(exc).__name__}",
+                    f"httpx invocation failed: {type(retry_exc).__name__}",
                     provider=provider_name,
-                ) from exc
+                ) from retry_exc
+        except ProviderUnavailableError:
+            raise
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f"httpx invocation failed: {type(exc).__name__}",
+                provider=provider_name,
+            ) from exc
+
+    async def _stream_openai_compatible_once(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        provider_name: str,
+        trust_env: Optional[bool] = None,
+    ) -> AsyncIterator[str]:
+        client_kwargs: Dict[str, Any] = {}
+        if trust_env is not None:
+            client_kwargs["trust_env"] = trust_env
+
+        async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[union-attr]
+            async with client.stream(
+                "POST",
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=60,
+            ) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    body = " ".join(body.split())[:400]
+                    raise ProviderUnavailableError(
+                        f"httpx invocation failed: HTTP {response.status_code}: {body}",
+                        provider=provider_name,
+                    )
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data.strip() == "[DONE]":
+                        break
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = payload.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
 
     async def _stream_anthropic_compatible(
         self,

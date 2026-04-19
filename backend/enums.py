@@ -5,10 +5,11 @@ from enum import Enum
 
 
 class CollaborationMode(str, Enum):
-    """15 种协作模式"""
+    """16 种协作模式"""
     CHAT = "chat"
     BRAINSTORM = "brainstorm"
     CODE_COLLABORATION = "code_collaboration"
+    CODE_WORKSPACE = "code_workspace"
     DATA_ANALYSIS = "data_analysis"
     DEBATE = "debate"
     WEREWOLF = "werewolf"

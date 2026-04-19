@@ -20,6 +20,7 @@ frontend/build/
 
 # pytest
 .pytest_cache/
+tests/
 
 # OS
 .DS_Store

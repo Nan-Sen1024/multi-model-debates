@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx
 
 from backend.enums import APIFormat, AuthType, ProviderType
 from backend.exceptions import (
@@ -25,6 +27,8 @@ from backend.llm_gateway import (
     SSOOIDCClient,
     _deobfuscate,
     _obfuscate,
+    deserialize_auth_config,
+    serialize_auth_config,
     validate_model_ref,
 )
 from backend.models import AuthConfig, OAuthToken, ProviderConfig
@@ -259,6 +263,24 @@ class TestApiKeyObfuscation:
         stored = AuthManager.store_api_key(key)
         loaded = AuthManager.load_api_key(stored)
         assert loaded == key
+
+
+class TestAuthConfigSerialization:
+    def test_serialize_and_deserialize_preserves_metadata(self):
+        config = AuthConfig(
+            auth_type=AuthType.OAUTH,
+            oauth_token=OAuthToken(access_token="oauth-access"),
+            metadata={
+                "authorization_endpoint": "https://example.com/authorize",
+                "token_endpoint": "https://example.com/token",
+                "client_id": "client-123",
+            },
+        )
+
+        payload = serialize_auth_config(config)
+        restored = deserialize_auth_config(AuthType.OAUTH, payload)
+
+        assert restored.metadata == config.metadata
 
     def test_obfuscated_key_is_not_plaintext(self):
         key = "sk-plaintext"
@@ -630,7 +652,366 @@ class TestGetLocalModels:
 
 
 # ===========================================================================
-# 9. validate_model_ref 属性测试（Property 12）
+# 9. LLMGatewayClient chat_stream（显式 provider 绑定）
+# ===========================================================================
+
+class TestLLMGatewayClientChatStream:
+    """需求：26.5、28.1"""
+
+    def test_explicit_provider_binding_accepts_bare_model_name(self):
+        provider = make_provider(
+            "deepseek",
+            provider_type=ProviderType.CUSTOM,
+            base_url="https://api.deepseek.com/v1",
+        )
+        captured = {}
+
+        async def fake_provider_httpx_stream(
+            self,
+            provider,
+            model,
+            messages,
+            headers,
+            auth_config,
+            provider_config,
+        ):
+            captured["provider_name"] = provider
+            captured["model"] = model
+            captured["messages"] = messages
+            captured["provider_config"] = provider_config
+            yield "hello"
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch.object(
+                LLMGatewayClient,
+                "_provider_httpx_stream",
+                fake_provider_httpx_stream,
+            ):
+                return [
+                    chunk
+                    async for chunk in client.chat_stream(
+                        "deepseek-chat",
+                        [{"role": "user", "content": "hi"}],
+                        provider_config=provider,
+                    )
+                ]
+
+        chunks = asyncio.run(run())
+
+        assert chunks == ["hello"]
+        assert captured["model"] == "deepseek-chat"
+        assert captured["provider_config"] == provider
+
+    def test_openai_oauth_runtime_uses_chatgpt_responses_entry(self):
+        provider = make_provider(
+            "openai-browser",
+            provider_type=ProviderType.OPENAI,
+            base_url="https://api.openai.com/v1",
+            auth_type=AuthType.OAUTH,
+            api_key=None,
+        )
+        provider.auth_type = AuthType.OAUTH
+        provider.auth_config = AuthConfig(
+            auth_type=AuthType.OAUTH,
+            oauth_token=OAuthToken(
+                access_token="oauth-access-token",
+                refresh_token="oauth-refresh-token",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            ),
+        )
+
+        captured: dict[str, object] = {}
+
+        class FakeResponsesStream:
+            def __init__(self, events):
+                self._events = list(events)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._events:
+                    raise StopAsyncIteration
+                return self._events.pop(0)
+
+        async def fake_aresponses(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return FakeResponsesStream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"output": []}},
+                ]
+            )
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch("backend.llm_gateway._load_litellm", return_value=True), patch(
+                "backend.llm_gateway.litellm",
+                SimpleNamespace(
+                    aresponses=fake_aresponses,
+                    acompletion=AsyncMock(side_effect=AssertionError("chat.completions should not be used")),
+                ),
+            ), patch(
+                "httpx.AsyncClient",
+                side_effect=AssertionError("browser OAuth OpenAI should not use /v1/chat/completions"),
+            ):
+                return [
+                    chunk
+                    async for chunk in client.chat_stream(
+                        "openai/gpt-5.3-codex",
+                        [{"role": "system", "content": "Stay focused"}, {"role": "user", "content": "hi"}],
+                        provider_config=provider,
+                    )
+                ]
+
+        chunks = asyncio.run(run())
+
+        assert chunks == ["hello"]
+        assert captured["kwargs"]["custom_llm_provider"] == "chatgpt"
+        assert captured["kwargs"]["stream"] is True
+        assert captured["kwargs"]["store"] is False
+        assert captured["kwargs"]["model"] == "gpt-5.3-codex"
+        assert "api_base" not in captured["kwargs"]
+        assert captured["kwargs"]["instructions"] == "Stay focused"
+        assert captured["kwargs"]["input"] == [
+            {"type": "message", "role": "user", "content": "hi"}
+        ]
+
+    def test_openai_oauth_runtime_maps_gpt_53_to_chatgpt_codex_alias(self):
+        provider = make_provider(
+            "openai-browser",
+            provider_type=ProviderType.OPENAI,
+            base_url="https://api.openai.com/v1",
+            auth_type=AuthType.OAUTH,
+            api_key=None,
+        )
+        provider.auth_type = AuthType.OAUTH
+        provider.auth_config = AuthConfig(
+            auth_type=AuthType.OAUTH,
+            oauth_token=OAuthToken(
+                access_token="oauth-access-token",
+                refresh_token="oauth-refresh-token",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            ),
+        )
+
+        captured: dict[str, object] = {}
+
+        class FakeResponsesStream:
+            def __init__(self, events):
+                self._events = list(events)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._events:
+                    raise StopAsyncIteration
+                return self._events.pop(0)
+
+        async def fake_aresponses(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return FakeResponsesStream(
+                [
+                    {"type": "response.output_text.delta", "delta": "hello"},
+                    {"type": "response.completed", "response": {"output": []}},
+                ]
+            )
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch("backend.llm_gateway._load_litellm", return_value=True), patch(
+                "backend.llm_gateway.litellm",
+                SimpleNamespace(
+                    aresponses=fake_aresponses,
+                    acompletion=AsyncMock(side_effect=AssertionError("chat.completions should not be used")),
+                ),
+            ):
+                return [
+                    chunk
+                    async for chunk in client.chat_stream(
+                        "openai/gpt-5.3",
+                        [{"role": "user", "content": "hi"}],
+                        provider_config=provider,
+                    )
+                ]
+
+        chunks = asyncio.run(run())
+
+        assert chunks == ["hello"]
+        assert captured["kwargs"]["custom_llm_provider"] == "chatgpt"
+        assert captured["kwargs"]["model"] == "gpt-5.3-codex"
+
+    def test_openai_oauth_runtime_surfaces_litellm_detail_on_failure(self):
+        provider = make_provider(
+            "openai-browser",
+            provider_type=ProviderType.OPENAI,
+            base_url="https://api.openai.com/v1",
+            auth_type=AuthType.OAUTH,
+            api_key=None,
+        )
+        provider.auth_type = AuthType.OAUTH
+        provider.auth_config = AuthConfig(
+            auth_type=AuthType.OAUTH,
+            oauth_token=OAuthToken(
+                access_token="oauth-access-token",
+                refresh_token="oauth-refresh-token",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            ),
+        )
+
+        async def fake_aresponses(*args, **kwargs):
+            raise RuntimeError("ChatgptException - {\"detail\":\"boom\"}")
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch("backend.llm_gateway._load_litellm", return_value=True), patch(
+                "backend.llm_gateway.litellm",
+                SimpleNamespace(
+                    aresponses=fake_aresponses,
+                    acompletion=AsyncMock(side_effect=AssertionError("chat.completions should not be used")),
+                ),
+            ):
+                return [
+                    chunk
+                    async for chunk in client.chat_stream(
+                        "openai/gpt-5.4",
+                        [{"role": "user", "content": "hi"}],
+                        provider_config=provider,
+                    )
+                ]
+
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            asyncio.run(run())
+
+        assert "boom" in str(exc_info.value)
+
+    def test_stream_openai_compatible_retries_direct_on_connect_error(self):
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        created_clients = []
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"hello"}}]}'
+                yield "data: [DONE]"
+
+        class FakeStreamContext:
+            def __init__(self, outcome):
+                self.outcome = outcome
+
+            async def __aenter__(self):
+                if isinstance(self.outcome, Exception):
+                    raise self.outcome
+                return self.outcome
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeClient:
+            def __init__(self, outcome, kwargs):
+                self.outcome = outcome
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                created_clients.append(self.kwargs)
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, *args, **kwargs):
+                return FakeStreamContext(self.outcome)
+
+        request = httpx.Request("POST", endpoint)
+        connect_error = httpx.ConnectError("All connection attempts failed", request=request)
+        outcomes = [connect_error, FakeResponse()]
+
+        def fake_async_client(*args, **kwargs):
+            return FakeClient(outcomes.pop(0), kwargs)
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch("httpx.AsyncClient", side_effect=fake_async_client):
+                return [
+                    chunk
+                    async for chunk in client._stream_openai_compatible(
+                        endpoint=endpoint,
+                        model="gpt-5.4",
+                        messages=[{"role": "user", "content": "hi"}],
+                        headers={"Authorization": "Bearer token"},
+                        provider_name="openai",
+                    )
+                ]
+
+        chunks = asyncio.run(run())
+
+        assert chunks == ["hello"]
+        assert len(created_clients) == 2
+        assert created_clients[0] == {}
+        assert created_clients[1]["trust_env"] is False
+
+    def test_stream_openai_compatible_surfaces_http_status_details(self):
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        error_body = '{"error":{"message":"Your account is not active","code":"billing_not_active"}}'
+
+        class FakeResponse:
+            status_code = 429
+
+            async def aread(self):
+                return error_body.encode("utf-8")
+
+            async def aiter_lines(self):
+                if False:
+                    yield ""
+
+        class FakeStreamContext:
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, *args, **kwargs):
+                return FakeStreamContext()
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch("httpx.AsyncClient", return_value=FakeClient()):
+                return [
+                    chunk
+                    async for chunk in client._stream_openai_compatible(
+                        endpoint=endpoint,
+                        model="gpt-5.4",
+                        messages=[{"role": "user", "content": "hi"}],
+                        headers={"Authorization": "Bearer token"},
+                        provider_name="openai",
+                    )
+                ]
+
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            asyncio.run(run())
+
+        assert "429" in str(exc_info.value)
+        assert "billing_not_active" in str(exc_info.value)
+
+
+# ===========================================================================
+# 10. validate_model_ref 属性测试（Property 12）
 # ===========================================================================
 
 class TestModelRefPropertyTest:

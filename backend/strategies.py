@@ -181,6 +181,18 @@ class CodeCollabStrategy(OneRoundStrategy):
         return "\n".join(["代码协作总结：", *suggestions]) if suggestions else super().build_summary(session, messages, reason)
 
 
+class WorkspaceStrategy(RoundRobinStrategy):
+    """代码工作区模式。"""
+
+    def build_system_prompt(self, participant: ModelParticipant, session: Session) -> str:
+        workspace_name = session.config.workspace.display_name if session.config.workspace and session.config.workspace.display_name else "本地代码工作区"
+        return (
+            f"你是代码工作区参与者 {participant.custom_id}。"
+            f"当前工作区：{workspace_name}。"
+            "请结合共享仓库上下文、历史输出和当前任务，给出专业、可执行的开发建议。"
+        )
+
+
 class DataAnalysisStrategy(OneRoundStrategy):
     """数据分析模式。"""
 
@@ -397,6 +409,7 @@ class StrategyRegistry:
             CollaborationMode.CHAT: ChatStrategy(),
             CollaborationMode.BRAINSTORM: BrainstormStrategy(),
             CollaborationMode.CODE_COLLABORATION: CodeCollabStrategy(),
+            CollaborationMode.CODE_WORKSPACE: WorkspaceStrategy(),
             CollaborationMode.DATA_ANALYSIS: DataAnalysisStrategy(),
             CollaborationMode.DEBATE: DebateStrategy(consensus_detector=consensus_detector),
             CollaborationMode.WEREWOLF: WerewolfStrategy(game_master=game_master),

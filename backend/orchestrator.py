@@ -20,8 +20,10 @@ from .exceptions import ValidationError
 from .llm_gateway import LLMGatewayClient, ProviderRouter, deserialize_auth_config, validate_model_ref
 from .message_store import MessageStore
 from .models import AuthConfig, Checkpoint, CollaborationMessage, ModelParticipant, ProviderConfig, Session, SessionConfig, SessionSnapshot, WorkspaceConfig
-from .workspace_context import build_workspace_file_context
+from .workspace_context import build_workspace_file_context, build_workspace_skill_context
 from .workspace_capabilities import workspace_capabilities_from_dict, workspace_capabilities_to_dict
+from .workspace_agent import WorkspaceAgentRunner, resolve_workspace_agent_profile
+from .workspace_mcp import WorkspaceMCPRuntime
 from .workspace_router import resolve_workspace_targets
 from .workspace_scanner import scan_workspace
 from .snapshot_manager import SnapshotManager
@@ -98,6 +100,7 @@ class SessionOrchestrator:
         snapshot_manager: Optional[SnapshotManager] = None,
         context_compressor: Optional[ContextCompressor] = None,
         drift_detector: Optional[DriftDetector] = None,
+        mcp_runtime_factory: Optional[callable] = None,
     ):
         self.db_path = db_path
         self.gateway = gateway or LLMGatewayClient()
@@ -108,6 +111,9 @@ class SessionOrchestrator:
         self.drift_detector = drift_detector or DriftDetector()
         self.strategy_registry = StrategyRegistry()
         self.provider_router = ProviderRouter()
+        self._mcp_runtime_factory = mcp_runtime_factory or (
+            lambda manifest: WorkspaceMCPRuntime(manifest=manifest)
+        )
         self._session_locks: Dict[str, asyncio.Lock] = {}
         self._session_runtime: Dict[str, SessionRuntimeState] = {}
 
@@ -477,6 +483,9 @@ class SessionOrchestrator:
 
             runtime.is_generating = True
             try:
+                mcp_runtime = self._mcp_runtime_factory(
+                    session.config.workspace.capabilities if session.config.workspace else None
+                )
                 for participant in targets:
                     prompt_messages = self._build_workspace_dispatch_messages(
                         session,
@@ -484,25 +493,66 @@ class SessionOrchestrator:
                         messages,
                         workspace_scan,
                     )
-                    full_content = ""
-                    try:
-                        async for chunk in self._iter_model_stream(participant, prompt_messages):
-                            full_content += chunk
-                            yield StreamChunk(
-                                "chunk",
-                                participant_id=participant.custom_id,
-                                content=chunk,
+                    agent_profile = resolve_workspace_agent_profile(
+                        session.config.workspace.capabilities if session.config.workspace else None,
+                        participant.custom_id,
+                    )
+                    if agent_profile is not None and agent_profile.mode not in {"disabled", "none"}:
+                        try:
+                            runner = WorkspaceAgentRunner(mcp_runtime)
+                            agent_result = await runner.run(
+                                session=session,
+                                participant=participant,
+                                prompt_messages=prompt_messages,
                                 round_number=session.current_round,
+                                model_stream_factory=lambda current_prompt_messages, current_participant=participant: self._collect_model_output(
+                                    current_participant,
+                                    current_prompt_messages,
+                                ),
+                                persist_tool_message=self.message_store.store_message,
                             )
-                    except Exception as exc:
-                        logger.exception("工作区参与者 %s 调用失败", participant.custom_id)
-                        yield StreamChunk(
-                            "error",
-                            participant_id=participant.custom_id,
-                            round_number=session.current_round,
-                            metadata={"code": "PROVIDER_UNAVAILABLE", "message": str(exc)},
-                        )
-                        return
+                        except Exception as exc:
+                            logger.exception("工作区 agent 参与者 %s 执行失败", participant.custom_id)
+                            yield StreamChunk(
+                                "error",
+                                participant_id=participant.custom_id,
+                                round_number=session.current_round,
+                                metadata={"code": "WORKSPACE_AGENT_ERROR", "message": str(exc)},
+                            )
+                            return
+                        for tool_message in agent_result.persisted_messages:
+                            messages.append(tool_message)
+                        for chunk in agent_result.emitted_chunks:
+                            yield StreamChunk(
+                                chunk.event,
+                                participant_id=chunk.participant_id,
+                                content=chunk.content,
+                                round_number=chunk.round_number,
+                                metadata=dict(chunk.metadata),
+                            )
+                        if agent_result.terminated:
+                            return
+                        full_content = agent_result.final_content
+                    else:
+                        full_content = ""
+                        try:
+                            async for chunk in self._iter_model_stream(participant, prompt_messages):
+                                full_content += chunk
+                                yield StreamChunk(
+                                    "chunk",
+                                    participant_id=participant.custom_id,
+                                    content=chunk,
+                                    round_number=session.current_round,
+                                )
+                        except Exception as exc:
+                            logger.exception("工作区参与者 %s 调用失败", participant.custom_id)
+                            yield StreamChunk(
+                                "error",
+                                participant_id=participant.custom_id,
+                                round_number=session.current_round,
+                                metadata={"code": "PROVIDER_UNAVAILABLE", "message": str(exc)},
+                            )
+                            return
 
                     message = CollaborationMessage(
                         id=str(uuid.uuid4()),
@@ -763,8 +813,21 @@ class SessionOrchestrator:
         history = self.message_store.build_message_history(messages, participant)
         if history:
             parts.append(history)
+        skill_context = build_workspace_skill_context(session, participant)
+        if skill_context:
+            parts.append(skill_context)
         parts.append(build_workspace_file_context(session, workspace_scan))
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": "\n\n".join(parts)}]
+
+    async def _collect_model_output(
+        self,
+        participant: ModelParticipant,
+        prompt_messages: List[Dict[str, str]],
+    ) -> str:
+        output = ""
+        async for chunk in self._iter_model_stream(participant, prompt_messages):
+            output += chunk
+        return output
 
     async def _iter_model_stream(
         self,

@@ -210,6 +210,69 @@ def test_build_history_empty_list(store):
     assert store.build_message_history([]) == ""
 
 
+async def _insert_summary(
+    db_path: str,
+    session_id: str,
+    covers_from: int,
+    covers_to: int,
+    summary_text: str,
+) -> None:
+    import aiosqlite
+    from backend.database import init_db
+
+    await init_db(db_path)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO compressed_summaries
+                (id, session_id, parent_id, covers_from, covers_to, summary_text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), session_id, None, covers_from, covers_to, summary_text, 0),
+        )
+        await db.commit()
+
+
+def test_load_renderable_messages_replaces_compressed_range_with_summary(store, session_id):
+    run(_create_session(store.db_path, session_id))
+    compressed_a = make_message(
+        session_id,
+        sender_id="ModelA",
+        content="原始长消息 A",
+        is_compressed=True,
+        round_number=1,
+    )
+    compressed_b = make_message(
+        session_id,
+        sender_id="ModelB",
+        content="原始长消息 B",
+        is_compressed=True,
+        round_number=2,
+    )
+    fresh = make_message(
+        session_id,
+        sender_id="ModelC",
+        content="最新消息",
+        round_number=3,
+    )
+
+    run(store.store_message(compressed_a))
+    run(store.store_message(compressed_b))
+    run(store.store_message(fresh))
+    run(_insert_summary(store.db_path, session_id, 1, 2, "压缩摘要"))
+
+    renderable = run(store.load_renderable_messages(session_id))
+    history = store.build_message_history(renderable)
+
+    assert len(renderable) == 2
+    assert renderable[0].is_compressed is True
+    assert renderable[0].content == "压缩摘要"
+    assert renderable[1].content == "最新消息"
+    assert history == "[历史摘要]: 压缩摘要\n[ModelC|dialogue]: 最新消息"
+    assert "原始长消息 A" not in history
+    assert "原始长消息 B" not in history
+
+
 async def _create_session(db_path: str, session_id: str) -> None:
     import aiosqlite
     from backend.database import init_db

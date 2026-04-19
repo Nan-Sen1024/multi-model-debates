@@ -66,6 +66,10 @@ async def collect_events(orchestrator: SessionOrchestrator, session_id: str):
     return [chunk async for chunk in orchestrator.dispatch_next(session_id)]
 
 
+async def collect_round_events(orchestrator: SessionOrchestrator, session_id: str):
+    return [chunk async for chunk in orchestrator.dispatch_round(session_id)]
+
+
 def test_dispatch_uses_explicit_provider_binding(tmp_path):
     db_path = str(tmp_path / "provider-explicit.db")
     gateway = FakeGateway()
@@ -122,3 +126,36 @@ def test_dispatch_auto_matches_provider_type_when_provider_id_missing(tmp_path):
     assert gateway.calls[0]["provider_config"] is not None
     assert gateway.calls[0]["provider_config"].id == "provider-openai"
     assert gateway.calls[0]["provider_config"].provider_type == ProviderType.OPENAI
+
+
+def test_dispatch_round_runs_every_participant_before_round_end(tmp_path):
+    db_path = str(tmp_path / "provider-round.db")
+    gateway = FakeGateway()
+    orchestrator = SessionOrchestrator(db_path=db_path, gateway=gateway)
+
+    session = run(
+        orchestrator.create_session(
+            CreateSessionRequest(
+                topic="test full round dispatch",
+                mode=CollaborationMode.CHAT,
+                participants=[
+                    ParticipantInput(model_ref="openai/gpt-4o", custom_id="A"),
+                    ParticipantInput(model_ref="anthropic/claude-3-5-sonnet", custom_id="B"),
+                ],
+            )
+        )
+    )
+
+    events = run(collect_round_events(orchestrator, session.id))
+
+    assert [call["model_ref"] for call in gateway.calls] == [
+        "openai/gpt-4o",
+        "anthropic/claude-3-5-sonnet",
+    ]
+    assert [(event.event, event.participant_id) for event in events] == [
+        ("chunk", "A"),
+        ("turn_end", "A"),
+        ("chunk", "B"),
+        ("turn_end", "B"),
+        ("round_end", None),
+    ]

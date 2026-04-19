@@ -3,8 +3,12 @@ import {
   ParticipantConfig,
   ProviderRecord,
   SessionDetail,
+  SessionListItem,
+  SessionMessageRecord,
   SessionResponse,
   SessionSnapshot,
+  SessionWorkspaceView,
+  WorkspaceConfigRecord,
   StreamPayload,
 } from "./types";
 
@@ -45,6 +49,7 @@ export async function createSession(input: {
   topic: string;
   mode: CollaborationMode;
   participants: ParticipantConfig[];
+  workspace?: WorkspaceConfigRecord | null;
 }): Promise<SessionResponse> {
   return request<SessionResponse>("/sessions", {
     method: "POST",
@@ -54,6 +59,42 @@ export async function createSession(input: {
 
 export async function getSession(sessionId: string): Promise<SessionDetail> {
   return request<SessionDetail>(`/sessions/${sessionId}`);
+}
+
+export async function getSessionWorkspace(
+  sessionId: string,
+): Promise<SessionWorkspaceView> {
+  return request<SessionWorkspaceView>(`/sessions/${sessionId}/workspace`);
+}
+
+export async function updateSession(
+  sessionId: string,
+  payload: { title?: string | null },
+): Promise<SessionDetail> {
+  return request<SessionDetail>(`/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteSession(
+  sessionId: string,
+): Promise<{ reason: string; summary: string }> {
+  return request<{ reason: string; summary: string }>(`/sessions/${sessionId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function listSessions(): Promise<SessionListItem[]> {
+  const data = await request<unknown>("/sessions");
+  return Array.isArray(data) ? (data as SessionListItem[]) : [];
+}
+
+export async function getSessionMessages(
+  sessionId: string,
+): Promise<SessionMessageRecord[]> {
+  const data = await request<unknown>(`/sessions/${sessionId}/messages`);
+  return Array.isArray(data) ? (data as SessionMessageRecord[]) : [];
 }
 
 export async function sendUserMessage(
@@ -98,6 +139,7 @@ export async function createProvider(payload: {
   api_format: string;
   auth_type: string;
   auth_value?: string;
+  auth_metadata?: Record<string, unknown>;
   fallback_ids: string[];
 }): Promise<{ id: string }> {
   return request<{ id: string }>("/providers", {
@@ -131,22 +173,67 @@ export async function discoverLocalModels(): Promise<{
   };
 }
 
+export interface ModelCatalogDiscoverProviderPayload {
+  name: string;
+  provider_type: string;
+  base_url?: string;
+  api_format: string;
+  auth_type: string;
+  auth_value?: string;
+  auth_metadata?: Record<string, unknown>;
+  fallback_ids: string[];
+}
+
+export interface ModelCatalogDiscoverRequest {
+  provider_id?: string;
+  provider?: ModelCatalogDiscoverProviderPayload;
+}
+
+export interface ModelCatalogDiscoverResult {
+  provider_id: string;
+  provider_name: string;
+  provider_type: string;
+  models: string[];
+  detected_at: number;
+}
+
+export async function discoverModelCatalog(
+  payload: ModelCatalogDiscoverRequest,
+): Promise<ModelCatalogDiscoverResult> {
+  return request<ModelCatalogDiscoverResult>("/model-catalog/discover", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function openSessionStream(
   sessionId: string,
   onEvent: (event: string, payload: StreamPayload) => void,
 ): () => void {
   const source = new EventSource(`${API_BASE}/sessions/${sessionId}/stream`);
+  const terminalEvents = new Set(["round_end", "session_end", "error"]);
+  let closed = false;
+  let terminalEventSeen = false;
 
   const bind = (eventName: string) => {
     source.addEventListener(eventName, (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as StreamPayload;
-      onEvent(eventName, payload);
+      const messageEvent = event as MessageEvent;
+      if (typeof messageEvent.data !== "string") return;
+      try {
+        const payload = JSON.parse(messageEvent.data) as StreamPayload;
+        if (terminalEvents.has(eventName)) {
+          terminalEventSeen = true;
+        }
+        onEvent(eventName, payload);
+      } catch {}
     });
   };
 
   [
+    "ping",
     "chunk",
     "turn_end",
+    "round_end",
     "drift_alert",
     "compression",
     "session_end",
@@ -154,12 +241,18 @@ export function openSessionStream(
   ].forEach(bind);
 
   source.onerror = () => {
+    if (closed || terminalEventSeen) {
+      return;
+    }
     onEvent("error", {
       message: "SSE 连接中断，请检查后端服务状态。",
     });
   };
 
-  return () => source.close();
+  return () => {
+    closed = true;
+    source.close();
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -167,13 +260,16 @@ export function openSessionStream(
 // ---------------------------------------------------------------------------
 
 export interface AuthFlowStartPayload {
-  flow_type: "aws_iam" | "openai_codex" | "generic_oauth";
-  // openai_codex / generic_oauth
+  flow_type: "aws_iam" | "aws_sso_pkce" | "openai_codex" | "generic_oauth" | "browser_oauth";
+  // openai_codex / generic_oauth / browser_oauth
   token_endpoint?: string;
+  authorization_endpoint?: string;
+  device_authorization_endpoint?: string;
   client_id?: string;
   client_secret?: string;
   scope?: string;
-  // aws_iam
+  login_variant?: "browser" | "device_code";
+  // aws_iam / aws_sso_pkce
   sso_start_url?: string;
   sso_region?: string;
 }
@@ -189,7 +285,7 @@ export interface AuthFlowStartResult {
 
 export interface AuthFlowStatusResult {
   auth_session_id: string;
-  status: "pending" | "completed" | "failed" | "expired" | "awaiting_role";
+  status: "pending" | "completed" | "failed" | "expired" | "cancelled" | "awaiting_role";
   flow_type: string;
   accounts?: Array<{ accountId: string; accountName: string; emailAddress: string }>;
   error_message?: string;
@@ -226,6 +322,25 @@ export async function bindAwsRole(
   });
 }
 
+export async function cancelAuthFlow(
+  providerId: string,
+  authSessionId: string,
+): Promise<AuthFlowStatusResult> {
+  return request<AuthFlowStatusResult>(
+    `/providers/${providerId}/auth/cancel/${authSessionId}`,
+    { method: "POST" },
+  );
+}
+
+export async function logoutProviderAuth(
+  providerId: string,
+): Promise<{ provider_id: string; status: string }> {
+  return request<{ provider_id: string; status: string }>(
+    `/providers/${providerId}/auth/logout`,
+    { method: "POST" },
+  );
+}
+
 export async function deleteProvider(providerId: string): Promise<{ deleted: string }> {
   return request<{ deleted: string }>(`/providers/${providerId}`, { method: "DELETE" });
 }
@@ -234,11 +349,12 @@ export async function updateProvider(
   providerId: string,
   payload: {
     name: string; provider_type: string; base_url?: string;
-    api_format: string; auth_type: string; auth_value?: string; fallback_ids: string[];
+    api_format: string; auth_type: string; auth_value?: string;
+    auth_metadata?: Record<string, unknown>; fallback_ids: string[];
   },
 ): Promise<{ updated: string }> {
   return request<{ updated: string }>(`/providers/${providerId}`, {
-    method: "PUT",
+    method: "PATCH",
     body: JSON.stringify(payload),
   });
 }

@@ -89,7 +89,7 @@ def test_property_anchor_private_info_isolated(secret_a, secret_b, mode):
         custom_id="ModelA",
         model_ref="openai/gpt-4o",
         sequence_order=0,
-        private_info=secret_a,
+        private_info=f"关键情报 {secret_a}",
     )
     participant_b = ModelParticipant(
         id=str(uuid.uuid4()),
@@ -97,13 +97,13 @@ def test_property_anchor_private_info_isolated(secret_a, secret_b, mode):
         custom_id="ModelB",
         model_ref="openai/gpt-4o",
         sequence_order=1,
-        private_info=secret_b,
+        private_info=f"关键情报 {secret_b}",
     )
     session = make_session([participant_a, participant_b], topic="游戏话题", mode=mode)
     anchor_a = injector.build_anchor(participant_a, session)
     anchor_b = injector.build_anchor(participant_b, session)
 
-    assert secret_a in anchor_a
-    assert secret_b not in anchor_a
-    assert secret_b in anchor_b
-    assert secret_a not in anchor_b
+    assert participant_a.private_info in anchor_a
+    assert participant_b.private_info not in anchor_a
+    assert participant_b.private_info in anchor_b
+    assert participant_a.private_info not in anchor_b

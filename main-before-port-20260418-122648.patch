@@ -1,0 +1,801 @@
+diff --git a/backend/api.py b/backend/api.py
+index bb12c3e..e596638 100644
+--- a/backend/api.py
++++ b/backend/api.py
+@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
+ 
+ import aiosqlite
+ from fastapi import FastAPI, HTTPException
+-from fastapi.responses import JSONResponse, StreamingResponse
++from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+ from pydantic import BaseModel, Field
+ 
+ from .database import DB_PATH, init_db
+@@ -16,6 +16,7 @@ from .exceptions import ValidationError
+ from .auth_flow import (
+     AuthFlowManager,
+     FLOW_AWS_IAM,
++    FLOW_AWS_SSO_PKCE,
+     FLOW_OPENAI_CODEX,
+     FLOW_GENERIC_OAUTH,
+ )
+@@ -383,6 +384,73 @@ class BindRolePayload(BaseModel):
+     role_name: str
+ 
+ 
++@app.get("/api/providers/{provider_id}/auth/callback")
++async def aws_pkce_callback(
++    provider_id: str,
++    code: Optional[str] = None,
++    state: Optional[str] = None,
++    error: Optional[str] = None,
++    error_description: Optional[str] = None,
++):
++    """
++    AWS SSO PKCE 回调端点。
++    AWS 登录完成后自动跳转到此 URL，前端试用轮询状态确认完成。
++    """
++    def _html_page(title: str, body: str, success: bool = True) -> HTMLResponse:
++        color = "#22c55e" if success else "#ef4444"
++        icon = "✅" if success else "❌"
++        return HTMLResponse(f"""
++<!DOCTYPE html>
++<html lang="zh">
++<head>
++  <meta charset="utf-8">
++  <title>{title}</title>
++  <style>
++    body {{ font-family: -apple-system, sans-serif; display: flex;
++            align-items: center; justify-content: center;
++            min-height: 100vh; margin: 0; background: #0f172a; color: #e2e8f0; }}
++    .card {{ text-align: center; padding: 48px; background: #1e293b;
++             border-radius: 16px; max-width: 400px; }}
++    h2 {{ color: {color}; font-size: 1.5rem; margin-bottom: 12px; }}
++    p {{ color: #94a3b8; }}
++  </style>
++  <script>setTimeout(() => window.close(), 2000);</script>
++</head>
++<body>
++  <div class="card">
++    <div style="font-size:48px;margin-bottom:16px">{icon}</div>
++    <h2>{title}</h2>
++    <p>{body}</p>
++  </div>
++</body>
++</html>
++        """)
++
++    # AWS 返回错误
++    if error:
++        msg = error_description or error
++        if state:
++            await auth_flow_manager._update_auth_session(
++                state, "failed", error_message=msg
++            )
++        return _html_page("登录失败", f"错误：{msg}。请关闭此窗口并重试。", success=False)
++
++    if not code or not state:
++        return _html_page("参数缺失", "请关闭此窗口并重新登录。", success=False)
++
++    try:
++        await auth_flow_manager.handle_pkce_callback(
++            auth_session_id=state,
++            code=code,
++        )
++    except Exception as exc:
++        import traceback
++        traceback.print_exc()
++        return _html_page("登录失败", f"凭证换取失败：{exc}。请关闭此窗口并重试。", success=False)
++
++    return _html_page("登录成功", "授权已完成！此窗口将自动关闭，请回到应用选择账号和角色。")
++
++
+ @app.post("/api/providers/{provider_id}/auth/start")
+ async def start_auth_flow(provider_id: str, payload: AuthFlowStartPayload):
+     """
+diff --git a/backend/auth_flow.py b/backend/auth_flow.py
+index ce50622..ea88423 100644
+--- a/backend/auth_flow.py
++++ b/backend/auth_flow.py
+@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
+ 
+ FLOW_OPENAI_CODEX = "openai_codex"
+ FLOW_AWS_IAM = "aws_iam"
++FLOW_AWS_SSO_PKCE = "aws_sso_pkce"
+ FLOW_GENERIC_OAUTH = "generic_oauth"
+ 
+ STATUS_PENDING = "pending"
+@@ -116,6 +117,9 @@ class AuthFlowManager:
+     def __init__(self, db_path: str = DB_PATH) -> None:
+         self.db_path = db_path
+         self._poll_tasks: Dict[str, asyncio.Task] = {}
++        # PKCE 会话上下文：auth_session_id -> {client_id, client_secret, code_verifier, ...}
++        # 同时也写入 DB，防止重启丢失
++        self._pkce_ctx: Dict[str, Dict[str, str]] = {}
+ 
+     # ------------------------------------------------------------------
+     # 公开接口
+@@ -147,7 +151,15 @@ class AuthFlowManager:
+                 sso_start_url=sso_start_url or "",
+                 sso_region=sso_region or "us-east-1",
+             )
+-        elif flow_type in (FLOW_OPENAI_CODEX, FLOW_GENERIC_OAUTH):
++        elif flow_type == FLOW_AWS_SSO_PKCE:
++            return await self._start_aws_pkce_flow(
++                provider_id=provider_id,
++                sso_start_url=sso_start_url or "",
++                sso_region=sso_region or "us-east-1",
++            )
++        elif flow_type == FLOW_OPENAI_CODEX:
++            return await self._start_openai_pkce_flow(provider_id=provider_id)
++        elif flow_type == FLOW_GENERIC_OAUTH:
+             return await self._start_oauth_flow(
+                 provider_id=provider_id,
+                 flow_type=flow_type,
+@@ -255,7 +267,192 @@ class AuthFlowManager:
+         )
+ 
+     # ------------------------------------------------------------------
+-    # AWS IAM Identity Center 流程
++    # AWS SSO PKCE (Authorization Code + PKCE) 流程
++    # ------------------------------------------------------------------
++
++    async def _start_aws_pkce_flow(
++        self,
++        provider_id: str,
++        sso_start_url: str,
++        sso_region: str,
++    ) -> FlowStartResult:
++        """
++        启动 AWS IAM Identity Center Authorization Code + PKCE 流程。
++        用户只需在浏览器完成 SSO 登录，无需手动输入设备码。
++        """
++        import hashlib
++        import secrets
++
++        if not sso_start_url:
++            raise ValueError("sso_start_url is required for PKCE flow")
++
++        # 生成 PKCE 参数
++        code_verifier = secrets.token_urlsafe(64)
++        digest = hashlib.sha256(code_verifier.encode()).digest()
++        import base64 as _b64
++        code_challenge = _b64.urlsafe_b64encode(digest).rstrip(b"=").decode()
++
++        auth_session_id = str(uuid.uuid4())
++        redirect_uri = f"http://127.0.0.1:8000/api/providers/{provider_id}/auth/callback"
++
++        oidc = SSOOIDCClient(sso_start_url=sso_start_url, sso_region=sso_region)
++
++        # 注册 PKCE 客户端
++        try:
++            reg = await asyncio.get_event_loop().run_in_executor(
++                None, lambda: oidc.register_client_pkce(redirect_uri)
++            )
++        except Exception as exc:
++            raise ProviderUnavailableError(
++                f"AWS SSO PKCE register_client failed: {exc}"
++            ) from exc
++
++        client_id_real = reg.get("clientId", "")
++        client_secret_real = reg.get("clientSecret", "")
++        expires_in = max(300, int(reg.get("clientSecretExpiresAt", 0)) - int(time.time()))
++
++        # 构建授权 URL（用户打开后直接登录）
++        auth_url = oidc.build_authorize_url(
++            client_id=client_id_real,
++            redirect_uri=redirect_uri,
++            state=auth_session_id,   # state = session ID，回调时用于对应会话
++            code_challenge=code_challenge,
++        )
++
++        now = int(time.time())
++
++        # 将敏感信息打包存入 device_code 字段（base64 混淆）
++        # 格式: code_verifier::client_id_real::client_secret_real
++        packed = f"{code_verifier}::{client_id_real}::{client_secret_real}"
++
++        async with aiosqlite.connect(self.db_path) as db:
++            await db.execute(
++                """INSERT INTO auth_sessions
++                   (id, provider_id, flow_type, status, verification_uri, user_code,
++                    device_code, client_id, client_secret, interval, expires_at,
++                    created_at, updated_at)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                (
++                    auth_session_id,
++                    provider_id,
++                    FLOW_AWS_SSO_PKCE,
++                    STATUS_PENDING,
++                    auth_url,
++                    "",                          # user_code 为空（无需手动输入）
++                    _obfuscate(packed),           # 敏感数据
++                    sso_start_url,               # 复用 client_id 字段
++                    sso_region,                  # 复用 client_secret 字段
++                    5,
++                    now + expires_in,
++                    now,
++                    now,
++                ),
++            )
++            await db.commit()
++
++        # 内存缓存（同步备份）
++        self._pkce_ctx[auth_session_id] = {
++            "client_id_real": client_id_real,
++            "client_secret_real": client_secret_real,
++            "code_verifier": code_verifier,
++            "sso_start_url": sso_start_url,
++            "sso_region": sso_region,
++            "redirect_uri": redirect_uri,
++            "provider_id": provider_id,
++        }
++
++        return FlowStartResult(
++            auth_session_id=auth_session_id,
++            verification_uri=auth_url,   # 前端直接 window.open 这个 URL
++            user_code="",               # PKCE 无需 user_code
++            expires_in=expires_in,
++            interval=5,
++            flow_type=FLOW_AWS_SSO_PKCE,
++        )
++
++    async def handle_pkce_callback(
++        self,
++        auth_session_id: str,
++        code: str,
++    ) -> None:
++        """
++        处理 AWS SSO PKCE 回调：用授权码换取 access_token，进入账号选择阶段。
++        由 api.py 的 /auth/callback 路由调用。
++        """
++        # 优先从内存取，其次从 DB 恢复
++        ctx = self._pkce_ctx.get(auth_session_id)
++        if ctx is None:
++            row = await self._load_auth_session(auth_session_id)
++            if row is None:
++                raise ValueError(f"PKCE session not found: {auth_session_id}")
++            packed_raw = _deobfuscate(row["device_code"]) if row["device_code"] else ""
++            parts = packed_raw.split("::", 2)
++            if len(parts) != 3:
++                raise ValueError("PKCE session state is corrupted")
++            code_verifier, client_id_real, client_secret_real = parts
++            sso_start_url = row["client_id"] or ""
++            sso_region = row["client_secret"] or ""
++            provider_id = row["provider_id"]
++            redirect_uri = f"http://127.0.0.1:8000/api/providers/{provider_id}/auth/callback"
++        else:
++            code_verifier = ctx["code_verifier"]
++            client_id_real = ctx["client_id_real"]
++            client_secret_real = ctx["client_secret_real"]
++            sso_start_url = ctx["sso_start_url"]
++            sso_region = ctx["sso_region"]
++            redirect_uri = ctx["redirect_uri"]
++            provider_id = ctx["provider_id"]
++
++        oidc = SSOOIDCClient(sso_start_url=sso_start_url, sso_region=sso_region)
++
++        # 换取 access_token
++        try:
++            token_data = await asyncio.get_event_loop().run_in_executor(
++                None,
++                lambda: oidc.exchange_auth_code(
++                    client_id=client_id_real,
++                    client_secret=client_secret_real,
++                    code=code,
++                    redirect_uri=redirect_uri,
++                    code_verifier=code_verifier,
++                ),
++            )
++        except Exception as exc:
++            await self._update_auth_session(
++                auth_session_id, STATUS_FAILED, error_message=str(exc)
++            )
++            raise
++
++        access_token = token_data.get("accessToken", "")
++
++        # 获取账号列表，进入 awaiting_role 状态
++        try:
++            accounts = oidc.list_accounts(access_token)
++        except Exception:
++            accounts = []
++
++        now = int(time.time())
++        async with aiosqlite.connect(self.db_path) as db:
++            await db.execute(
++                """UPDATE auth_sessions SET
++                    status = ?, access_token = ?,
++                    accounts_json = ?, updated_at = ?
++                   WHERE id = ?""",
++                (
++                    STATUS_AWAITING_ROLE,
++                    _obfuscate(access_token),
++                    json.dumps(accounts),
++                    now,
++                    auth_session_id,
++                ),
++            )
++            await db.commit()
++
++        self._pkce_ctx.pop(auth_session_id, None)
++        logger.info("PKCE callback completed for session %s", auth_session_id)
++
++    # ------------------------------------------------------------------
++    # AWS IAM Identity Center Device Code 流程
+     # ------------------------------------------------------------------
+ 
+     async def _start_aws_iam_flow(
+@@ -357,28 +554,9 @@ class AuthFlowManager:
+         except ImportError:
+             raise ProviderUnavailableError("httpx is required for OAuth device flow")
+ 
+-        # openai_codex 使用固定配置
++        # openai_codex 现已改用 authorization code PKCE flow
+         if flow_type == FLOW_OPENAI_CODEX:
+-            effective_client_id = OPENAI_CODEX_CLIENT_ID
+-            effective_scope = OPENAI_CODEX_SCOPE
+-            # 从 OIDC discovery 获取 device_authorization_endpoint
+-            discovery_url = f"{OPENAI_CODEX_OIDC_ISSUER}/.well-known/openid-configuration"
+-            try:
+-                resp = _httpx.get(discovery_url, timeout=10)
+-                resp.raise_for_status()
+-                discovery = resp.json()
+-                device_auth_endpoint = discovery.get(
+-                    "device_authorization_endpoint",
+-                    f"{OPENAI_CODEX_OIDC_ISSUER}/oauth/device/code",
+-                )
+-                effective_token_endpoint = discovery.get(
+-                    "token_endpoint",
+-                    f"{OPENAI_CODEX_OIDC_ISSUER}/oauth/token",
+-                )
+-            except Exception as exc:
+-                logger.warning("OIDC discovery failed, using defaults: %s", exc)
+-                device_auth_endpoint = f"{OPENAI_CODEX_OIDC_ISSUER}/oauth/device/code"
+-                effective_token_endpoint = f"{OPENAI_CODEX_OIDC_ISSUER}/oauth/token"
++            raise ProviderUnavailableError("openai_codex device code is replaced by pkce")
+         else:
+             effective_client_id = client_id or ""
+             effective_scope = scope or "openid"
+@@ -456,6 +634,174 @@ class AuthFlowManager:
+             flow_type=flow_type,
+         )
+ 
++    async def _start_openai_pkce_flow(self, provider_id: str) -> FlowStartResult:
++        import hashlib, base64, secrets, traceback, httpx
++        from urllib.parse import urlencode, urlparse, parse_qs
++
++        client_id = OPENAI_CODEX_CLIENT_ID
++        code_verifier = secrets.token_urlsafe(32)
++        code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).decode().rstrip("=")
++        auth_session_id = str(uuid.uuid4())
++
++        params = {
++            "response_type": "code",
++            "client_id": client_id,
++            "redirect_uri": "http://localhost:1455/auth/callback",
++            "scope": "openid profile email offline_access api.connectors.read api.connectors.invoke",
++            "code_challenge": code_challenge,
++            "code_challenge_method": "S256",
++            "id_token_add_organizations": "true",
++            "codex_cli_simplified_flow": "true",
++            "state": auth_session_id,
++            "originator": "codex_cli_rs"
++        }
++        verification_uri = f"{OPENAI_CODEX_OIDC_ISSUER}/oauth/authorize?" + urlencode(params)
++        
++        if not hasattr(self, "_pkce_ctx"):
++            self._pkce_ctx = {}
++
++        self._pkce_ctx[auth_session_id] = {
++            "client_id": client_id,
++            "code_verifier": code_verifier,
++            "redirect_uri": "http://localhost:1455/auth/callback",
++            "token_endpoint": f"{OPENAI_CODEX_OIDC_ISSUER}/oauth/token",
++            "provider_id": provider_id,
++        }
++
++        now = int(time.time())
++        expires_at = now + 900
++        async with aiosqlite.connect(self.db_path) as db:
++            await db.execute(
++                """INSERT INTO auth_sessions
++                   (id, provider_id, flow_type, status, verification_uri,
++                    user_code, interval, expires_at, created_at, updated_at)
++                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++                (
++                    auth_session_id, provider_id, FLOW_OPENAI_CODEX, STATUS_PENDING,
++                    verification_uri, "请在浏览器登录...", 2, expires_at, now, now
++                ),
++            )
++            await db.commit()
++
++        # 启动 1455 端口本地 HTTP 服务监听
++        asyncio.create_task(self._spawn_local_callback_server(auth_session_id))
++
++        return FlowStartResult(
++            auth_session_id=auth_session_id,
++            verification_uri=verification_uri,
++            user_code="请在浏览器登录...",
++            expires_in=900,
++            interval=2,
++            flow_type=FLOW_OPENAI_CODEX,
++        )
++
++    async def _spawn_local_callback_server(self, auth_session_id: str):
++        import traceback, httpx
++        from urllib.parse import urlparse, parse_qs
++
++        def _html_page(title: str, body: str, success: bool = True) -> bytes:
++            color = "#22c55e" if success else "#ef4444"
++            icon = "✅" if success else "❌"
++            content = f"""HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n
++<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>{title}</title>
++<style>body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#e2e8f0;}}
++.card{{text-align:center;padding:48px;background:#1e293b;border-radius:16px;}}
++h2{{color:{color};}}p{{color:#94a3b8;}}</style>
++<script>setTimeout(() => window.close(), 2000);</script></head>
++<body><div class="card"><div style="font-size:48px;">{icon}</div><h2>{title}</h2><p>{body}</p></div></body></html>"""
++            return content.encode("utf-8")
++
++        async def _handle_client(reader, writer):
++            try:
++                request = (await reader.read(4096)).decode("utf-8", errors="ignore")
++                if not request.startswith("GET"):
++                    writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
++                    await writer.drain()
++                    return
++
++                first_line = request.split("\n")[0]
++                path_query = first_line.split(" ")[1]
++                parsed = urlparse(path_query)
++                query = parse_qs(parsed.query)
++
++                code = query.get("code", [None])[0]
++                state = query.get("state", [None])[0]
++                err = query.get("error", [None])[0]
++
++                if err:
++                    writer.write(_html_page("登录失败", f"Error: {err}", False))
++                elif state != auth_session_id or not code:
++                    writer.write(_html_page("参数错误", "验证通过失败", False))
++                    await self._update_auth_session(auth_session_id, "failed", error_message="State or code invalid")
++                else:
++                    ctx = self._pkce_ctx.get(auth_session_id)
++                    if not ctx:
++                        writer.write(_html_page("时效过期", "请重新发起链接", False))
++                        await self._update_auth_session(auth_session_id, "failed", error_message="Context expired")
++                    else:
++                        async with httpx.AsyncClient() as client:
++                            resp = await client.post(
++                                ctx["token_endpoint"],
++                                json={
++                                    "grant_type": "authorization_code",
++                                    "client_id": ctx["client_id"],
++                                    "code": code,
++                                    "redirect_uri": ctx["redirect_uri"],
++                                    "code_verifier": ctx["code_verifier"],
++                                },
++                                timeout=15,
++                            )
++                        if resp.status_code == 200:
++                            data = resp.json()
++                            access_token = data.get("access_token")
++                            
++                            # 保存 accessToken
++                            import aiosqlite
++                            import json
++                            from .database import DB_PATH
++                            async with aiosqlite.connect(DB_PATH) as db:
++                                db.row_factory = aiosqlite.Row
++                                async with db.execute("SELECT auth_config FROM provider_configs WHERE id = ?", (ctx["provider_id"],)) as cur:
++                                    row = await cur.fetchone()
++                                    if row:
++                                        config = json.loads(row["auth_config"] or "{}")
++                                        config["api_key"] = access_token
++                                        await db.execute("UPDATE provider_configs SET auth_config = ? WHERE id = ?", (json.dumps(config), ctx["provider_id"]))
++                                        await db.commit()
++                            
++                            await self._update_auth_session(auth_session_id, "completed")
++                            writer.write(_html_page("登录成功", "授权已完成！窗口将自动关闭。"))
++                        else:
++                            await self._update_auth_session(auth_session_id, "failed", error_message=resp.text)
++                            writer.write(_html_page("鉴权失败", "无法通过 code 置换 Token: " + resp.text, False))
++            except Exception as e:
++                traceback.print_exc()
++                writer.write(_html_page("内部崩溃", str(e), False))
++            finally:
++                writer.close()
++                try:
++                    await writer.wait_closed()
++                except Exception:
++                    pass
++                server.close()
++
++        server = None
++        try:
++            server = await asyncio.start_server(_handle_client, '127.0.0.1', 1455)
++            await server.serve_forever()
++        except OSError as e:
++            logger.error("Failed to start callback server: %s", e)
++            await self._update_auth_session(auth_session_id, "failed", error_message="1455 端口被占用，无法回调")
++        except asyncio.CancelledError:
++            pass
++        finally:
++            if server:
++                server.close()
++                try:
++                    await server.wait_closed()
++                except Exception:
++                    pass
++
+     # ------------------------------------------------------------------
+     # 后台轮询任务
+     # ------------------------------------------------------------------
+diff --git a/backend/llm_gateway.py b/backend/llm_gateway.py
+index a3f2c9c..767eb49 100644
+--- a/backend/llm_gateway.py
++++ b/backend/llm_gateway.py
+@@ -63,8 +63,11 @@ def validate_model_ref(model_ref: str) -> Tuple[str, str]:
+             field="model_ref",
+         )
+ 
+-    parts = model_ref.split("/")
+-    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
++    parts = model_ref.split("/", 1)
++    if len(parts) == 1:
++        return "custom", parts[0].strip()
++    
++    if not parts[0].strip() or not parts[1].strip():
+         raise ValidationError(
+             f"Invalid Model_Ref '{model_ref}'; expected provider/model",
+             field="model_ref",
+@@ -279,6 +282,72 @@ class SSOOIDCClient:
+             response.raise_for_status()
+             return response.json().get("accountList", [])
+ 
++    def register_client_pkce(self, redirect_uri: str) -> Dict[str, Any]:
++        """注册支持 authorization_code + PKCE 的 OIDC 客户端。"""
++        if not _HTTPX_AVAILABLE:
++            raise ProviderUnavailableError("httpx is required for SSO OIDC PKCE registration")
++        with httpx.Client() as client:
++            response = client.post(
++                f"{self._oidc_endpoint()}/client/register",
++                json={
++                    "clientName": "multi-model-debate-pkce",
++                    "clientType": "public",
++                    "scopes": ["sso:account:access"],
++                    "grantTypes": ["authorization_code", "refresh_token"],
++                    "redirectUris": [redirect_uri],
++                },
++                timeout=10,
++            )
++            response.raise_for_status()
++            return response.json()
++
++    def build_authorize_url(
++        self,
++        client_id: str,
++        redirect_uri: str,
++        state: str,
++        code_challenge: str,
++    ) -> str:
++        """构造 PKCE 授权 URL，用户在浏览器中打开此 URL 完成 SSO 登录。"""
++        from urllib.parse import urlencode
++        params = {
++            "response_type": "code",
++            "client_id": client_id,
++            "redirect_uri": redirect_uri,
++            "scope": "sso:account:access",
++            "state": state,
++            "code_challenge": code_challenge,
++            "code_challenge_method": "S256",
++        }
++        return f"{self._oidc_endpoint()}/authorize?" + urlencode(params)
++
++    def exchange_auth_code(
++        self,
++        client_id: str,
++        client_secret: str,
++        code: str,
++        redirect_uri: str,
++        code_verifier: str,
++    ) -> Dict[str, Any]:
++        """用授权码换取 access_token（PKCE flow）。"""
++        if not _HTTPX_AVAILABLE:
++            raise ProviderUnavailableError("httpx is required for auth code exchange")
++        with httpx.Client() as client:
++            response = client.post(
++                f"{self._oidc_endpoint()}/token",
++                json={
++                    "clientId": client_id,
++                    "clientSecret": client_secret,
++                    "grantType": "authorization_code",
++                    "redirectUri": redirect_uri,
++                    "code": code,
++                    "codeVerifier": code_verifier,
++                },
++                timeout=10,
++            )
++            response.raise_for_status()
++            return response.json()
++
+     def list_account_roles(self, access_token: str, account_id: str) -> List[Dict[str, Any]]:
+         if not _HTTPX_AVAILABLE:
+             raise ProviderUnavailableError("httpx is required to list SSO roles")
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 8508ce0..490b609 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -170,7 +170,7 @@ export default function App(): JSX.Element {
+   // ── Auth flows ─────────────────────────────────────────────────────────────
+   async function handleStartAuthFlow(
+     providerId: string,
+-    flowType: "aws_iam" | "openai_codex" | "generic_oauth",
++    flowType: "aws_iam" | "aws_sso_pkce" | "openai_codex" | "generic_oauth",
+     extra: Record<string, string> = {},
+   ) {
+     try {
+@@ -180,6 +180,9 @@ export default function App(): JSX.Element {
+         userCode: result.user_code, expiresIn: result.expires_in, status: "pending", flowType: result.flow_type,
+       };
+       setAuthFlows((prev) => ({ ...prev, [providerId]: flowState }));
++      if ((flowType === "aws_sso_pkce" || flowType === "openai_codex") && result.verification_uri) {
++        window.open(result.verification_uri, "_blank", "width=600,height=800");
++      }
+       const interval = result.interval * 1000;
+       const timer = setInterval(async () => {
+         try {
+@@ -468,6 +471,47 @@ function TabQuickStart({ onNavigate }: { onNavigate: (tab: 0 | 1 | 2 | 3) => voi
+   );
+ }
+ 
++// ─── AWS SSO Login Component ──────────────────────────────────────────────────
++function AwsSsoLoginButton({ providerId, onStartAuthFlow }: { providerId: string; onStartAuthFlow: (id: string, flowType: "aws_sso_pkce" | "aws_iam", extra: any) => void }) {
++  const [isOpen, setIsOpen] = useState(false);
++  const [url, setUrl] = useState("");
++  const [region, setRegion] = useState("us-east-1");
++
++  if (!isOpen) {
++    return <button className="ghost-button small primary" onClick={() => setIsOpen(true)}>AWS 登录</button>;
++  }
++
++  return (
++    <div style={{ display: "inline-flex", gap: "8px", alignItems: "center", background: "#1e293b", padding: "8px", borderRadius: "8px", marginTop: "8px", width: "100%" }}>
++      <input 
++        type="text" 
++        placeholder="SSO Start URL" 
++        value={url} 
++        onChange={e => setUrl(e.target.value)} 
++        style={{ flex: 2, minWidth: 0, padding: "4px 8px", borderRadius: "4px", border: "1px solid #334155", background: "#0f172a", color: "#f8fafc" }} 
++      />
++      <input 
++        type="text" 
++        placeholder="Region" 
++        value={region} 
++        onChange={e => setRegion(e.target.value)} 
++        style={{ flex: 1, minWidth: 0, padding: "4px 8px", borderRadius: "4px", border: "1px solid #334155", background: "#0f172a", color: "#f8fafc" }} 
++      />
++      <button 
++        className="ghost-button small primary"
++        disabled={!url}
++        onClick={() => {
++          onStartAuthFlow(providerId, "aws_sso_pkce", { sso_start_url: url, sso_region: region });
++          setIsOpen(false);
++        }}
++      >
++        继续
++      </button>
++      <button className="ghost-button small" onClick={() => setIsOpen(false)}>取消</button>
++    </div>
++  );
++}
++
+ // ─── Tab 1: Provider Config ───────────────────────────────────────────────────
+ interface TabProvidersProps {
+   providers: ProviderRecord[];
+@@ -642,11 +686,31 @@ function TabProviders({
+                       {flow && flow.status === "awaiting_role" && (
+                         <div className="auth-flow-box">
+                           <p>✅ 授权完成，请选择 AWS 账号和角色：</p>
+-                          <select value={(awsRoleSelection[p.id] || {}).accountId || ""} onChange={(e) => setAwsRoleSelection((prev) => ({ ...prev, [p.id]: { ...(prev[p.id] || { roleName: "" }), accountId: e.target.value } }))}>
+-                            <option value="">选择账号</option>
+-                            {(flow.accounts || []).map((acc) => <option key={acc.accountId} value={acc.accountId}>{acc.accountName} ({acc.accountId})</option>)}
+-                          </select>
+-                          <input placeholder="角色名称，如 AdministratorAccess" value={(awsRoleSelection[p.id] || {}).roleName || ""} onChange={(e) => setAwsRoleSelection((prev) => ({ ...prev, [p.id]: { ...(prev[p.id] || { accountId: "" }), roleName: e.target.value } }))} />
++                          <div style={{ display: "flex", gap: "8px", width: "100%", marginBottom: "8px" }}>
++                            {flow.accounts && flow.accounts.length > 0 ? (
++                              <select 
++                                style={{ flex: 1 }}
++                                value={(awsRoleSelection[p.id] || {}).accountId || ""} 
++                                onChange={(e) => setAwsRoleSelection((prev) => ({ ...prev, [p.id]: { ...(prev[p.id] || { roleName: "" }), accountId: e.target.value } }))}
++                              >
++                                <option value="">选择账号</option>
++                                {flow.accounts.map((acc) => <option key={acc.accountId} value={acc.accountId}>{acc.accountName} ({acc.accountId})</option>)}
++                              </select>
++                            ) : (
++                              <input 
++                                style={{ flex: 1 }}
++                                placeholder="没拉取到列表，请手动输入 12 位 AWS 账号 ID" 
++                                value={(awsRoleSelection[p.id] || {}).accountId || ""} 
++                                onChange={(e) => setAwsRoleSelection((prev) => ({ ...prev, [p.id]: { ...(prev[p.id] || { roleName: "" }), accountId: e.target.value } }))} 
++                              />
++                            )}
++                            <input 
++                              style={{ flex: 1 }}
++                              placeholder="角色名称，如 AWSAdministratorAccess" 
++                              value={(awsRoleSelection[p.id] || {}).roleName || ""} 
++                              onChange={(e) => setAwsRoleSelection((prev) => ({ ...prev, [p.id]: { ...(prev[p.id] || { accountId: "" }), roleName: e.target.value } }))} 
++                            />
++                          </div>
+                           <button className="primary-button small" onClick={() => onBindAwsRole(p.id)}>绑定角色</button>
+                         </div>
+                       )}
+@@ -801,9 +865,10 @@ function TabSessionDetail({
+     // 每次调用 GET /stream 都会触发后端 dispatch_next 调度一轮
+     const close = openSessionStream(session.id, (eventName, payload) => {
+       startTransition(() => onStreamEvent(eventName, payload));
+-      // 一轮结束后自动停止 streaming 状态
+-      if (eventName === "turn_end" || eventName === "session_end") {
++      // 一轮结束后自动停止 streaming 状态并且主动断开，防止浏览器 EventSource 自动断线重连抛出错误
++      if (eventName === "turn_end" || eventName === "session_end" || eventName === "error") {
+         setStreaming(false);
++        close();
+       }
+     });
+     closeStreamRef.current = close;
+diff --git a/frontend/src/api.ts b/frontend/src/api.ts
+index 12e9dbd..1c524ab 100644
+--- a/frontend/src/api.ts
++++ b/frontend/src/api.ts
+@@ -139,8 +139,12 @@ export function openSessionStream(
+ 
+   const bind = (eventName: string) => {
+     source.addEventListener(eventName, (event) => {
+-      const payload = JSON.parse((event as MessageEvent).data) as StreamPayload;
+-      onEvent(eventName, payload);
++      const e = event as MessageEvent;
++      if (e.data === undefined) return;
++      try {
++        const payload = JSON.parse(e.data) as StreamPayload;
++        onEvent(eventName, payload);
++      } catch (err) {}
+     });
+   };
+ 
+@@ -167,13 +171,13 @@ export function openSessionStream(
+ // ---------------------------------------------------------------------------
+ 
+ export interface AuthFlowStartPayload {
+-  flow_type: "aws_iam" | "openai_codex" | "generic_oauth";
++  flow_type: "aws_iam" | "aws_sso_pkce" | "openai_codex" | "generic_oauth";
+   // openai_codex / generic_oauth
+   token_endpoint?: string;
+   client_id?: string;
+   client_secret?: string;
+   scope?: string;
+-  // aws_iam
++  // aws_iam / aws_sso_pkce
+   sso_start_url?: string;
+   sso_region?: string;
+ }
+diff --git a/requirements.txt b/requirements.txt
+index dc53a78..c860461 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,8 +1,8 @@
+-fastapi>=0.111.0
+-uvicorn[standard]>=0.29.0
+-litellm>=1.40.0
++#fastapi>=0.111.0
++#uvicorn[standard]>=0.29.0
++#litellm>=1.40.0
+ sentence-transformers>=3.0.0
+-hypothesis>=6.100.0
+-pytest>=8.0.0
+-pytest-asyncio>=0.23.0
+-aiosqlite>=0.20.0
++#hypothesis>=6.100.0
++#pytest>=8.0.0
++#pytest-asyncio>=0.23.0
++#aiosqlite>=0.20.0

@@ -492,6 +492,105 @@ textarea { resize: vertical; }
   margin-bottom: 12px;
 }
 
+.workspace-panel {
+  display: grid;
+  gap: 14px;
+}
+.workspace-create-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.workspace-create-grid .field:nth-child(3),
+.workspace-create-grid .field:nth-child(4) {
+  grid-column: 1 / -1;
+}
+.workspace-hint {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(15, 109, 95, 0.06);
+  border: 1px solid rgba(15, 109, 95, 0.12);
+}
+.workspace-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.workspace-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(176, 77, 30, 0.08);
+  border: 1px solid rgba(176, 77, 30, 0.14);
+  color: var(--primary-strong);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.workspace-session-panel {
+  display: grid;
+  gap: 12px;
+}
+.workspace-summary-card,
+.workspace-card {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(34, 27, 22, 0.08);
+  background: rgba(255, 252, 247, 0.86);
+}
+.workspace-meta {
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink);
+  word-break: break-word;
+}
+.workspace-card-title {
+  margin: 0 0 8px;
+  font-family: var(--display);
+  font-size: 14px;
+}
+.workspace-path-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.workspace-path {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(34, 27, 22, 0.06);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.workspace-tree {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+.workspace-tree-node {
+  display: grid;
+  gap: 6px;
+}
+.workspace-tree-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+  word-break: break-word;
+}
+.workspace-tree-kind {
+  min-width: 18px;
+  text-align: center;
+}
+
 /* ── Session Detail Tab ────────────────────────────────────────────────────── */
 .session-layout {
   display: grid;
@@ -502,6 +601,51 @@ textarea { resize: vertical; }
 .chat-panel-new {
   display: grid;
   gap: 14px;
+}
+.session-history-strip {
+  display: grid;
+  gap: 10px;
+}
+.session-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 252, 247, 0.82);
+}
+.session-history-item-active {
+  border-color: rgba(176, 77, 30, 0.3);
+  box-shadow: inset 0 0 0 1px rgba(176, 77, 30, 0.14);
+}
+.session-history-button {
+  display: grid;
+  gap: 2px;
+  justify-items: start;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+.session-history-button strong {
+  font-size: 14px;
+}
+.session-history-button span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.session-history-button-active strong {
+  color: var(--primary);
+}
+.session-history-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .session-status-bar {
   display: flex;
