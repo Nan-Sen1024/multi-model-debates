@@ -1744,7 +1744,6 @@ function TabSessionDetail({
 }: TabSessionDetailProps) {
   const closeStreamRef = useRef<(() => void) | null>(null);
   const streamTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const messageStreamRef = useRef<HTMLDivElement>(null);
   const autoScrollPinnedRef = useRef(true);
   const sessionResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -1819,9 +1818,7 @@ function TabSessionDetail({
     if (!autoScrollPinnedRef.current) {
       return;
     }
-    messagesEndRef.current?.scrollIntoView({
-      behavior: isStreaming ? "auto" : "smooth",
-    });
+    scrollMessageStreamToBottom(isStreaming ? "auto" : "smooth");
   }, [messages, isStreaming]);
 
   useEffect(() => {
@@ -1862,6 +1859,21 @@ function TabSessionDetail({
     autoScrollPinnedRef.current = isNearMessageStreamBottom(event.currentTarget);
   }
 
+  function scrollMessageStreamToBottom(behavior: ScrollBehavior) {
+    const node = messageStreamRef.current;
+    if (!node) {
+      return;
+    }
+    if (typeof node.scrollTo === "function") {
+      node.scrollTo({
+        top: node.scrollHeight,
+        behavior,
+      });
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }
+
   function startSessionResize(event: React.MouseEvent<HTMLDivElement>) {
     sessionResizeRef.current = {
       startX: event.clientX,
@@ -1881,7 +1893,7 @@ function TabSessionDetail({
       return;
     }
     autoScrollPinnedRef.current = true;
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    scrollMessageStreamToBottom("smooth");
     onSetStreamState("connecting");
     // 每次调用 GET /stream 都会触发后端 dispatch_round 调度完整一轮
     const close = openSessionStream(session.id, (eventName, payload) => {
@@ -1992,7 +2004,6 @@ function TabSessionDetail({
                 </div>
               ))
             }
-            <div ref={messagesEndRef} />
           </div>
 
           {/* Actions */}

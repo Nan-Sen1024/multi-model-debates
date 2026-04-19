@@ -240,4 +240,63 @@ describe("App streaming watchdog", () => {
     expect(container.textContent).toContain("new chunk while reading history");
     expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
   });
+
+  test("keeps auto-scroll inside the message list instead of scrolling the whole page", async () => {
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const startButton = Array.from(container.querySelectorAll("button")).find(
+      (node) => node.textContent?.includes("开始下一轮"),
+    ) as HTMLButtonElement | undefined;
+
+    expect(startButton).toBeDefined();
+
+    const messageStream = container.querySelector(".message-stream") as HTMLDivElement | null;
+    expect(messageStream).not.toBeNull();
+
+    Object.defineProperty(messageStream, "scrollHeight", {
+      configurable: true,
+      value: 1000,
+    });
+    Object.defineProperty(messageStream, "clientHeight", {
+      configurable: true,
+      value: 320,
+    });
+    Object.defineProperty(messageStream, "scrollTop", {
+      configurable: true,
+      writable: true,
+      value: 680,
+    });
+    Object.defineProperty(messageStream, "scrollTo", {
+      configurable: true,
+      value: jest.fn(({ top }: { top: number }) => {
+        messageStream.scrollTop = top;
+      }),
+    });
+
+    (Element.prototype.scrollIntoView as jest.Mock).mockClear();
+
+    await act(async () => {
+      startButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(streamCallback).not.toBeNull();
+
+    await act(async () => {
+      streamCallback?.("chunk", {
+        participant_id: "ModelA",
+        content: "stream keeps going",
+        round: 1,
+      });
+      await Promise.resolve();
+    });
+
+    expect(messageStream.scrollTop).toBe(1000);
+    expect(messageStream.scrollTo).toHaveBeenCalled();
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+  });
 });
