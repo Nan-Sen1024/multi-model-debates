@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import string
-from datetime import datetime
+from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 
 import aiosqlite
@@ -15,6 +15,10 @@ from backend.database import init_db
 from backend.enums import MessageType
 from backend.message_store import MessageStore
 from backend.models import CollaborationMessage
+
+
+def utc_now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def run(coro):
@@ -63,7 +67,7 @@ message_strategy = st.builds(
     is_compressed=st.booleans(),
     drift_score=st.one_of(st.none(), st.floats(min_value=0, max_value=1, allow_nan=False, allow_infinity=False)),
     round_number=st.integers(min_value=0, max_value=20),
-    created_at=st.just(datetime.utcnow()),
+    created_at=st.just(utc_now_naive()),
 )
 
 
@@ -103,7 +107,7 @@ history_message_strategy = st.builds(
     is_compressed=st.booleans(),
     drift_score=st.none(),
     round_number=st.integers(min_value=0, max_value=5),
-    created_at=st.just(datetime.utcnow()),
+    created_at=st.just(utc_now_naive()),
 )
 
 

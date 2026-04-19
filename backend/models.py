@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .enums import (
@@ -16,6 +16,10 @@ from .enums import (
     SessionStatus,
 )
 from .workspace_capabilities import WorkspaceCapabilityManifest
+
+
+def utc_now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @dataclass
@@ -108,8 +112,8 @@ class Session:
     snapshot: SessionSnapshot
     current_round: int = 0
     next_speaker_index: int = 0
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now_naive)
+    updated_at: datetime = field(default_factory=utc_now_naive)
 
 
 @dataclass
@@ -123,7 +127,7 @@ class CollaborationMessage:
     is_compressed: bool = False
     drift_score: Optional[float] = None
     round_number: int = 0
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now_naive)
 
 
 @dataclass
@@ -144,4 +148,4 @@ class Checkpoint:
     mode: str
     snapshot: SessionSnapshot
     next_step: str
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now_naive)

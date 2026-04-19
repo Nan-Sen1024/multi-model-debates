@@ -13,6 +13,21 @@ function finalizeLiveMessage(liveMessage: ChatMessage | null): ChatMessage[] {
   return [{ ...liveMessage, status: "done" }];
 }
 
+function systemStreamMessage(
+  id: string,
+  content: string,
+  round: number,
+): ChatMessage {
+  return {
+    id,
+    senderId: "system",
+    type: "system",
+    content,
+    round,
+    status: "done",
+  };
+}
+
 export function applyStreamEvent(
   state: SessionStreamViewState,
   eventName: string,
@@ -102,6 +117,57 @@ export function applyStreamEvent(
       ],
       liveMessage: null,
       streamState: "failed",
+    };
+  }
+
+  if (eventName === "agent_plan") {
+    return {
+      ...state,
+      messages: [
+        ...state.messages,
+        systemStreamMessage(
+          `agent-plan-${Date.now()}`,
+          `[Agent 计划] ${payload.participant_id || "Unknown"}\n${payload.content || ""}`,
+          payload.round || 0,
+        ),
+      ],
+      streamState: "streaming",
+    };
+  }
+
+  if (eventName === "tool_call") {
+    const toolTarget = [payload.server_name, payload.tool_name].filter(Boolean).join(".");
+    const argumentsText =
+      payload.arguments && Object.keys(payload.arguments).length > 0
+        ? `\n${JSON.stringify(payload.arguments, null, 2)}`
+        : "";
+    return {
+      ...state,
+      messages: [
+        ...state.messages,
+        systemStreamMessage(
+          `tool-call-${Date.now()}`,
+          `[工具调用] ${payload.participant_id || "Unknown"} -> ${toolTarget || "unknown"}${argumentsText}`,
+          payload.round || 0,
+        ),
+      ],
+      streamState: "streaming",
+    };
+  }
+
+  if (eventName === "tool_result") {
+    const toolTarget = [payload.server_name, payload.tool_name].filter(Boolean).join(".");
+    return {
+      ...state,
+      messages: [
+        ...state.messages,
+        systemStreamMessage(
+          `tool-result-${Date.now()}`,
+          `[工具结果] ${toolTarget || "unknown"}\n${payload.text || payload.content || ""}`,
+          payload.round || 0,
+        ),
+      ],
+      streamState: "streaming",
     };
   }
 

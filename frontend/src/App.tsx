@@ -61,7 +61,15 @@ import {
   saveLastSessionId,
 } from "./sessionPersistence";
 import { applyStreamEvent, SessionStreamViewState } from "./sessionStream";
-import { WorkspaceCreatePanel, WorkspaceDraftState, WorkspaceSessionPanel } from "./WorkspaceMode";
+import {
+  buildWorkspaceCapabilitiesFromDraft,
+  createEmptyWorkspaceMCPDraft,
+  createEmptyWorkspaceParticipantOverrideDraft,
+  WorkspaceCreatePanel,
+  WorkspaceDraftState,
+  WorkspaceDraftUpdate,
+  WorkspaceSessionPanel,
+} from "./WorkspaceMode";
 import {
   AuthFlowState,
   ChatMessage,
@@ -90,6 +98,20 @@ const initialWorkspaceDraft: WorkspaceDraftState = {
   displayName: "",
   selectedPaths: "",
   scanExcludes: "",
+  skillSources: "",
+  mcpServers: [createEmptyWorkspaceMCPDraft()],
+  agent: {
+    mode: "tool_loop",
+    maxSteps: "6",
+    canWrite: false,
+    allowedSkills: "",
+    allowedMcpServers: "",
+    memoryScope: "workspace_shared",
+  },
+  participantOverrides: {
+    Model_A: createEmptyWorkspaceParticipantOverrideDraft(),
+    Model_B: createEmptyWorkspaceParticipantOverrideDraft(),
+  },
 };
 
 type ProviderDraft = {
@@ -254,12 +276,13 @@ export default function App(): JSX.Element {
   function mapStoredMessage(message: SessionMessageRecord): ChatMessage {
     const isUserMessage =
       message.sender_id === "[用户]" || message.message_type === "user_intervention";
-    const isSystemMessage = !isUserMessage && message.sender_id === "system";
+    const isToolMessage = message.message_type === "tool_output";
+    const isSystemMessage = !isUserMessage && (message.sender_id === "system" || isToolMessage);
     return {
       id: message.id,
       senderId: message.sender_id,
       type: isUserMessage ? "user" : isSystemMessage ? "system" : "model",
-      content: message.content,
+      content: isToolMessage ? `[工具输出]\n${message.content}` : message.content,
       round: message.round_number,
       driftScore: typeof message.drift_score === "number" ? message.drift_score : undefined,
       status: typeof message.drift_score === "number" ? "warning" : "done",
@@ -689,6 +712,7 @@ export default function App(): JSX.Element {
               selected_paths: parseTextareaLines(workspaceDraft.selectedPaths),
               scan_excludes: parseTextareaLines(workspaceDraft.scanExcludes),
               index_status: "pending",
+              capabilities: buildWorkspaceCapabilitiesFromDraft(workspaceDraft),
             }
           : undefined;
       if (mode === "code_workspace" && !workspace?.root_path) {
@@ -910,13 +934,17 @@ export default function App(): JSX.Element {
           workspaceDraft={workspaceDraft}
           participants={participants}
           providers={providers}
-          providerCatalogs={Object.values(providerCatalogs)}
-          loading={loading}
-          onWorkspaceDraftChange={(patch) => setWorkspaceDraft((current) => ({ ...current, ...patch }))}
-          onUpdateParticipant={updateParticipant}
-          onAddParticipant={addParticipant}
-          onRemoveParticipant={removeParticipant}
-          onSubmit={handleCreateSession}
+  providerCatalogs={Object.values(providerCatalogs)}
+  loading={loading}
+  onWorkspaceDraftChange={(update) =>
+    setWorkspaceDraft((current) =>
+      typeof update === "function" ? update(current) : { ...current, ...update },
+    )
+  }
+  onUpdateParticipant={updateParticipant}
+  onAddParticipant={addParticipant}
+  onRemoveParticipant={removeParticipant}
+  onSubmit={handleCreateSession}
         />
       )}
 
@@ -1559,7 +1587,7 @@ interface TabCreateSessionProps {
   providers: ProviderRecord[];
   providerCatalogs: ProviderModelCatalog[];
   loading: boolean;
-  onWorkspaceDraftChange: (patch: Partial<WorkspaceDraftState>) => void;
+  onWorkspaceDraftChange: (update: WorkspaceDraftUpdate) => void;
   onUpdateParticipant: (i: number, p: Partial<ParticipantConfig>) => void;
   onAddParticipant: () => void;
   onRemoveParticipant: (i: number) => void;
@@ -1953,6 +1981,7 @@ function TabSessionDetail({
             <WorkspaceSessionPanel
               workspace={workspace}
               participants={session.participants}
+              capabilities={session.workspace?.capabilities}
             />
           )}
 

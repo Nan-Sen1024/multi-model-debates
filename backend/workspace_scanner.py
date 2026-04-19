@@ -12,6 +12,7 @@ from .exceptions import ValidationError
 
 DEFAULT_SCAN_EXCLUDES = {
     ".git",
+    ".hypothesis",
     ".hg",
     ".svn",
     "__pycache__",

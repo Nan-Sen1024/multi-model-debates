@@ -8,7 +8,7 @@ import asyncio
 import os
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pytest
@@ -16,6 +16,10 @@ import pytest
 from backend.enums import MessageType
 from backend.message_store import MessageStore
 from backend.models import CollaborationMessage
+
+
+def utc_now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # 使用 asyncio.run() 包装协程，不依赖 pytest-asyncio
@@ -43,7 +47,7 @@ def make_message(
         is_compressed=is_compressed,
         drift_score=drift_score,
         round_number=round_number,
-        created_at=datetime.utcnow(),
+        created_at=utc_now_naive(),
     )
 
 

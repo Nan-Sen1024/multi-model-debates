@@ -280,4 +280,191 @@ describe("App code workspace mode", () => {
 
     expect(container.textContent).toContain("正在查看 README");
   });
+
+  test("scans workspace preview and submits selected tree paths", async () => {
+    let createSessionBody: Record<string, unknown> | null = null;
+
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions" && !init?.method) {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/workspace/preview" && init?.method === "POST") {
+        return mockJsonResponse({
+          root_path: "D:/repo/demo",
+          display_name: "demo-repo",
+          repo_fingerprint: "preview-fingerprint",
+          scan_excludes: [".git"],
+          selected_paths: [],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "3 个文件，2 个顶层目录/文件",
+          files: ["README.md", "backend/api.py", "backend/orchestrator.py"],
+          tree: [
+            {
+              name: "README.md",
+              path: "README.md",
+              kind: "file",
+              children: [],
+            },
+            {
+              name: "backend",
+              path: "backend",
+              kind: "dir",
+              children: [
+                {
+                  name: "api.py",
+                  path: "backend/api.py",
+                  kind: "file",
+                  children: [],
+                },
+                {
+                  name: "orchestrator.py",
+                  path: "backend/orchestrator.py",
+                  kind: "file",
+                  children: [],
+                },
+              ],
+            },
+          ],
+        });
+      }
+      if (path === "/api/sessions" && init?.method === "POST") {
+        createSessionBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return mockJsonResponse({
+          id: "workspace-session",
+          status: "active",
+          mode: "code_workspace",
+        });
+      }
+      if (path === "/api/sessions/workspace-session") {
+        return mockJsonResponse({
+          id: "workspace-session",
+          title: "workspace",
+          topic: "评审本地仓库",
+          mode: "code_workspace",
+          status: "active",
+          current_round: 0,
+          participants: [
+            { id: "p1", custom_id: "Model_A", model_ref: "anthropic/claude-4.6", is_active: true },
+            { id: "p2", custom_id: "Model_B", model_ref: "openai/gpt-5.4", is_active: true },
+          ],
+          workspace: {
+            root_path: "D:/repo/demo",
+            display_name: "demo-repo",
+            repo_fingerprint: "preview-fingerprint",
+            scan_excludes: [".git"],
+            selected_paths: ["backend"],
+            index_status: "ready",
+            last_scanned_at: 1710000000,
+            summary: "3 个文件，2 个顶层目录/文件",
+          },
+        });
+      }
+      if (path === "/api/sessions/workspace-session/snapshot") {
+        return mockJsonResponse({
+          topic: "评审本地仓库",
+          mode: "code_workspace",
+          participant_summaries: {},
+          consensus_list: [],
+          key_events: [],
+        });
+      }
+      if (path === "/api/sessions/workspace-session/workspace") {
+        return mockJsonResponse({
+          root_path: "D:/repo/demo",
+          display_name: "demo-repo",
+          repo_fingerprint: "preview-fingerprint",
+          scan_excludes: [".git"],
+          selected_paths: ["backend"],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "3 个文件，2 个顶层目录/文件",
+          files: ["README.md", "backend/api.py", "backend/orchestrator.py"],
+          tree: [],
+        });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("创建会话"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const workspaceCard = Array.from(container.querySelectorAll(".mode-card")).find((node) =>
+      node.textContent?.includes("代码工作区"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      workspaceCard?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const rootPathInput = container.querySelector(
+      'input[placeholder*="multi-model-debates"]',
+    ) as HTMLInputElement | null;
+    expect(rootPathInput).not.toBeNull();
+
+    await act(async () => {
+      rootPathInput!.value = "D:/repo/demo";
+      Simulate.change(rootPathInput!);
+      await Promise.resolve();
+    });
+
+    const scanButton = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("扫描工作区"),
+    ) as HTMLButtonElement | undefined;
+    expect(scanButton).toBeDefined();
+
+    await act(async () => {
+      scanButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("backend/api.py");
+
+    const backendCheckbox = container.querySelector(
+      'input[data-workspace-select-path="backend"]',
+    ) as HTMLInputElement | null;
+    expect(backendCheckbox).not.toBeNull();
+
+    await act(async () => {
+      backendCheckbox!.checked = true;
+      Simulate.change(backendCheckbox!);
+      await Promise.resolve();
+    });
+
+    const createButton = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("🚀 创建会话"),
+    ) as HTMLButtonElement | undefined;
+    expect(createButton).toBeDefined();
+
+    await act(async () => {
+      createButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      for (let i = 0; i < 4; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    expect(createSessionBody).not.toBeNull();
+    expect(createSessionBody?.workspace).toMatchObject({
+      root_path: "D:/repo/demo",
+      selected_paths: ["backend"],
+    });
+  });
 });

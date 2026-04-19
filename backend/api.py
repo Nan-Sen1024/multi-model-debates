@@ -93,6 +93,11 @@ class WorkspacePayload(BaseModel):
     capabilities: Optional["WorkspaceCapabilityManifestPayload"] = None
 
 
+class WorkspacePreviewPayload(BaseModel):
+    root_path: str
+    scan_excludes: List[str] = Field(default_factory=list)
+
+
 class SkillSourcePayload(BaseModel):
     path: str
     source_type: str = "local"
@@ -220,6 +225,31 @@ def _workspace_tree_payload(entries: List[Any]) -> List[Dict[str, Any]]:
             }
         )
     return payload
+
+
+def _workspace_scan_payload(
+    *,
+    root_path: str,
+    display_name: Optional[str],
+    scan_excludes: List[str],
+    selected_paths: List[str],
+    index_status: str,
+    capabilities: Optional[Dict[str, Any]],
+    scan_result: Any,
+) -> Dict[str, Any]:
+    return {
+        "root_path": root_path,
+        "display_name": display_name or scan_result.display_name,
+        "repo_fingerprint": scan_result.repo_fingerprint,
+        "scan_excludes": list(scan_excludes),
+        "selected_paths": list(selected_paths),
+        "index_status": index_status,
+        "last_scanned_at": scan_result.scanned_at,
+        "summary": scan_result.summary,
+        "capabilities": capabilities,
+        "files": scan_result.files,
+        "tree": _workspace_tree_payload(scan_result.tree),
+    }
 
 
 def _provider_config_from_row(row: aiosqlite.Row) -> ProviderConfig:
@@ -415,20 +445,38 @@ async def get_session_workspace(session_id: str):
         workspace.last_scanned_at = scan_result.scanned_at
         workspace.index_status = "ready"
         await orchestrator._persist_session_runtime(session)
-        return {
-            "root_path": workspace.root_path,
-            "display_name": workspace.display_name or scan_result.display_name,
-            "repo_fingerprint": workspace.repo_fingerprint or scan_result.repo_fingerprint,
-            "scan_excludes": list(workspace.scan_excludes),
-            "selected_paths": list(workspace.selected_paths),
-            "index_status": workspace.index_status,
-            "last_scanned_at": scan_result.scanned_at,
-            "summary": scan_result.summary,
-            "files": scan_result.files,
-            "tree": _workspace_tree_payload(scan_result.tree),
-        }
+        return _workspace_scan_payload(
+            root_path=workspace.root_path,
+            display_name=workspace.display_name,
+            scan_excludes=list(workspace.scan_excludes),
+            selected_paths=list(workspace.selected_paths),
+            index_status=workspace.index_status,
+            capabilities=workspace_capabilities_to_dict(workspace.capabilities),
+            scan_result=scan_result,
+        )
     except ValidationError as exc:
         return error_response(exc, 404)
+
+
+@app.post("/api/workspace/preview")
+async def preview_workspace(payload: WorkspacePreviewPayload):
+    try:
+        root_path = payload.root_path.strip()
+        if not root_path:
+            raise ValidationError("工作区路径不能为空。", field="workspace.root_path")
+        scan_excludes = [item.strip() for item in payload.scan_excludes if item.strip()]
+        scan_result = scan_workspace(root_path, scan_excludes)
+        return _workspace_scan_payload(
+            root_path=root_path,
+            display_name=None,
+            scan_excludes=scan_excludes,
+            selected_paths=[],
+            index_status="ready",
+            capabilities=None,
+            scan_result=scan_result,
+        )
+    except ValidationError as exc:
+        return error_response(exc)
 
 
 @app.delete("/api/sessions/{session_id}")

@@ -10,7 +10,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, List, Optional, Tuple
 
 import aiosqlite
@@ -234,7 +234,7 @@ class ContextCompressor:
             mode=mode_str,
             snapshot=session.snapshot,
             next_step=next_step,
-            created_at=datetime.utcfromtimestamp(created_at_ts),
+            created_at=datetime.fromtimestamp(created_at_ts, tz=timezone.utc).replace(tzinfo=None),
         )
         logger.info("Checkpoint %s written for session %s", checkpoint_id, session.id)
         return checkpoint
@@ -273,7 +273,7 @@ class ContextCompressor:
             mode=row["mode"],
             snapshot=snapshot,
             next_step=row["next_step"] or "",
-            created_at=datetime.utcfromtimestamp(row["created_at"]),
+            created_at=datetime.fromtimestamp(row["created_at"], tz=timezone.utc).replace(tzinfo=None),
         )
         return checkpoint, snapshot
 

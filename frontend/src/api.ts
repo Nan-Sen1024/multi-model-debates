@@ -67,6 +67,16 @@ export async function getSessionWorkspace(
   return request<SessionWorkspaceView>(`/sessions/${sessionId}/workspace`);
 }
 
+export async function previewWorkspace(input: {
+  root_path: string;
+  scan_excludes: string[];
+}): Promise<SessionWorkspaceView> {
+  return request<SessionWorkspaceView>("/workspace/preview", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function updateSession(
   sessionId: string,
   payload: { title?: string | null },
@@ -232,6 +242,9 @@ export function openSessionStream(
   [
     "ping",
     "chunk",
+    "agent_plan",
+    "tool_call",
+    "tool_result",
     "turn_end",
     "round_end",
     "drift_alert",

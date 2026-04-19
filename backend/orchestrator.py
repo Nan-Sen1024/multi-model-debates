@@ -677,7 +677,7 @@ class SessionOrchestrator:
             await db.commit()
 
     async def _persist_session_runtime(self, session: Session) -> None:
-        session.updated_at = datetime.utcnow()
+        session.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await init_db(self.db_path)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("UPDATE collaboration_sessions SET topic = ?, mode = ?, config = ?, updated_at = ? WHERE id = ?", (session.topic, session.mode.value, self._serialize_session_config(session), int(session.updated_at.timestamp()), session.id))

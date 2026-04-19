@@ -19,6 +19,9 @@ export type CollaborationMode =
 export type StreamEventType =
   | "ping"
   | "chunk"
+  | "agent_plan"
+  | "tool_call"
+  | "tool_result"
   | "turn_end"
   | "round_end"
   | "drift_alert"
@@ -100,6 +103,7 @@ export interface WorkspaceConfigRecord {
   index_status: string;
   last_scanned_at?: number | null;
   summary?: string | null;
+  capabilities?: WorkspaceCapabilityManifest | null;
 }
 
 export interface WorkspaceTreeEntry {
@@ -138,6 +142,47 @@ export interface ChatMessage {
   status?: "streaming" | "done" | "warning" | "error";
 }
 
+export interface SkillSourceConfig {
+  path: string;
+  source_type: string;
+  label?: string | null;
+  recursive: boolean;
+  enabled: boolean;
+}
+
+export interface MCPServerConfig {
+  name: string;
+  transport: string;
+  command?: string | null;
+  args: string[];
+  url?: string | null;
+  env: Record<string, string>;
+  tools_allowlist: string[];
+  enabled: boolean;
+}
+
+export interface AgentProfileConfig {
+  mode: string;
+  max_steps: number;
+  can_write: boolean;
+  allowed_skills: string[];
+  allowed_mcp_servers: string[];
+  memory_scope: string;
+}
+
+export interface ParticipantCapabilityConfig {
+  agent?: AgentProfileConfig | null;
+  skills: string[];
+  mcp_servers: string[];
+}
+
+export interface WorkspaceCapabilityManifest {
+  skill_sources: SkillSourceConfig[];
+  mcp_servers: MCPServerConfig[];
+  agent_defaults: AgentProfileConfig;
+  participant_overrides: Record<string, ParticipantCapabilityConfig>;
+}
+
 export interface StreamPayload {
   participant_id?: string;
   content?: string;
@@ -150,6 +195,11 @@ export interface StreamPayload {
   summary?: string;
   code?: string;
   message?: string;
+  server_name?: string;
+  tool_name?: string;
+  arguments?: Record<string, unknown>;
+  text?: string;
+  ts?: number;
 }
 
 export interface AuthFlowState {

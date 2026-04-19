@@ -95,4 +95,61 @@ describe("openSessionStream", () => {
       },
     ]);
   });
+
+  test("forwards workspace agent events", () => {
+    const received: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    openSessionStream("session-4", (event, payload) => {
+      received.push({ event, payload: payload as Record<string, unknown> });
+    });
+
+    MockEventSource.instances[0].emit("agent_plan", {
+      participant_id: "claude",
+      content: "先列目录",
+      round: 1,
+    });
+    MockEventSource.instances[0].emit("tool_call", {
+      participant_id: "claude",
+      server_name: "filesystem",
+      tool_name: "list_directory",
+      round: 1,
+    });
+    MockEventSource.instances[0].emit("tool_result", {
+      participant_id: "claude",
+      server_name: "filesystem",
+      tool_name: "list_directory",
+      text: "README.md",
+      round: 1,
+    });
+
+    expect(received).toEqual([
+      {
+        event: "agent_plan",
+        payload: {
+          participant_id: "claude",
+          content: "先列目录",
+          round: 1,
+        },
+      },
+      {
+        event: "tool_call",
+        payload: {
+          participant_id: "claude",
+          server_name: "filesystem",
+          tool_name: "list_directory",
+          round: 1,
+        },
+      },
+      {
+        event: "tool_result",
+        payload: {
+          participant_id: "claude",
+          server_name: "filesystem",
+          tool_name: "list_directory",
+          text: "README.md",
+          round: 1,
+        },
+      },
+    ]);
+  });
 });
