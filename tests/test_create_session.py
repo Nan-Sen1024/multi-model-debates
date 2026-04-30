@@ -271,3 +271,17 @@ def test_create_session_persisted(orchestrator):
             assert [r["custom_id"] for r in rows] == ["Bot1", "Bot2"]
 
     run(_check())
+
+
+def test_create_session_reserved_all_alias_is_rejected(orchestrator):
+    req = CreateSessionRequest(
+        topic="reserved alias",
+        mode=CollaborationMode.CHAT,
+        participants=[
+            ParticipantInput(model_ref="openai/gpt-4o", custom_id="all"),
+            ParticipantInput(model_ref="anthropic/claude-3", custom_id="B"),
+        ],
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        run(orchestrator.create_session(req))
+    assert "custom_id" in str(exc_info.value.field or "")

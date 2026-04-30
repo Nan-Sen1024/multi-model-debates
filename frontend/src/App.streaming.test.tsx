@@ -188,6 +188,45 @@ describe("App streaming watchdog", () => {
     expect(container.textContent).toContain("still streaming");
   });
 
+  test("renders execution telemetry in the live execution log", async () => {
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const startButton = Array.from(container.querySelectorAll("button")).find(
+      (node) => node.textContent?.includes("开始下一轮"),
+    ) as HTMLButtonElement | undefined;
+
+    expect(startButton).toBeDefined();
+
+    await act(async () => {
+      startButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(streamCallback).not.toBeNull();
+
+    await act(async () => {
+      streamCallback?.("phase_start", {
+        participant_id: "ModelA",
+        phase: "build_prompt",
+        summary: "构建会话上下文",
+        round: 1,
+      });
+      await Promise.resolve();
+    });
+
+    const executionRow = container.querySelector(
+      '[data-execution-kind="phase"]',
+    ) as HTMLElement | null;
+    expect(executionRow).not.toBeNull();
+    expect(executionRow?.textContent).toContain("构建会话上下文");
+    expect(executionRow?.textContent).toContain("build_prompt");
+    expect(container.querySelector('[data-message-type="execution"]')).toBeNull();
+  });
+
   test("does not force scroll back to bottom while the user is reading older messages", async () => {
     await act(async () => {
       root.render(React.createElement(App));

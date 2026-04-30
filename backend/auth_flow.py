@@ -20,17 +20,18 @@ import os
 import shutil
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import aiosqlite
 
-from .database import DB_PATH, init_db
+from .database import DB_PATH, get_db, init_db
 from .llm_gateway import (
     AuthManager,
     SSOOIDCClient,
-    _deobfuscate,
-    _obfuscate,
+    decrypt_sensitive_value,
+    encrypt_sensitive_value,
     deserialize_auth_config,
     serialize_auth_config,
 )
@@ -90,10 +91,6 @@ class BindRoleResult:
     auth_session_id: str
     account_id: str
     role_name: str
-    # Sigv4 临时凭证（不直接暴露给前端，仅写入 provider auth_config）
-    access_key_id: str = ""
-    secret_access_key: str = ""
-    session_token: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +132,16 @@ class AuthFlowManager:
     - 将完成的 token 写回 provider_configs.auth_config
     """
 
-    def __init__(self, db_path: str = DB_PATH) -> None:
+    def __init__(self, db_path: str = DB_PATH, start_interactive_listeners: bool = True) -> None:
         self.db_path = db_path
+        self.start_interactive_listeners = start_interactive_listeners
         self._poll_tasks: Dict[str, asyncio.Task] = {}
         self._interactive_tasks: Dict[str, asyncio.Task] = {}
         # PKCE 会话上下文：auth_session_id -> {client_id, client_secret, code_verifier, ...}
         # 同时也写入 DB，防止重启丢失
         self._pkce_ctx: Dict[str, Dict[str, str]] = {}
+        self._active_provider_flows: Dict[str, str] = {}
+        self._provider_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -169,6 +169,16 @@ class AuthFlowManager:
         同时在后台启动轮询任务。
         """
         await init_db(self.db_path)
+
+        async with self._provider_locks[provider_id]:
+            active_session_id = self._active_provider_flows.get(provider_id)
+            if active_session_id:
+                active_row = await self._load_auth_session(active_session_id)
+                if active_row is not None and active_row["status"] in (STATUS_PENDING, STATUS_AWAITING_ROLE):
+                    raise ValueError(
+                        f"Provider '{provider_id}' already has an active authentication flow"
+                    )
+                self._active_provider_flows.pop(provider_id, None)
 
         if flow_type == FLOW_AWS_IAM:
             return await self._start_aws_iam_flow(
@@ -245,7 +255,7 @@ class AuthFlowManager:
         if row["status"] != STATUS_AWAITING_ROLE:
             raise ValueError(f"Auth session is not in awaiting_role state: {row['status']}")
 
-        access_token = _deobfuscate(row["access_token"]) if row["access_token"] else ""
+        access_token = decrypt_sensitive_value(row["access_token"]) if row["access_token"] else ""
         if not access_token:
             raise AuthenticationError("No access token available for role binding")
 
@@ -272,7 +282,8 @@ class AuthFlowManager:
 
         # 更新 auth_session
         now = int(time.time())
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """UPDATE auth_sessions SET
                     status = ?, selected_account_id = ?, selected_role_name = ?,
@@ -282,23 +293,23 @@ class AuthFlowManager:
                     STATUS_COMPLETED,
                     account_id,
                     role_name,
-                    _obfuscate(json.dumps(sigv4)),
+                    encrypt_sensitive_value(json.dumps(sigv4)),
                     now,
                     auth_session_id,
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         # 将 Sigv4 凭证写回 provider_configs.auth_config
         await self._write_sigv4_to_provider(row["provider_id"], sigv4, access_token, row)
 
+        self._cleanup_provider_flow(row["provider_id"], auth_session_id)
         return BindRoleResult(
             auth_session_id=auth_session_id,
             account_id=account_id,
             role_name=role_name,
-            access_key_id=access_key_id,
-            secret_access_key=secret_access_key,
-            session_token=session_token,
         )
 
     async def cancel_flow(
@@ -314,6 +325,7 @@ class AuthFlowManager:
             await self._cancel_tracked_task(self._poll_tasks, auth_session_id)
             await self._cancel_tracked_task(self._interactive_tasks, auth_session_id)
             self._pkce_ctx.pop(auth_session_id, None)
+            self._cleanup_provider_flow(row["provider_id"], auth_session_id)
             await self._update_auth_session(auth_session_id, STATUS_CANCELLED, error_message=reason)
             row = await self._load_auth_session(auth_session_id)
 
@@ -345,7 +357,8 @@ class AuthFlowManager:
             metadata=preserved_metadata,
         )
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 "UPDATE provider_configs SET auth_config = ? WHERE id = ?",
                 (
@@ -354,10 +367,12 @@ class AuthFlowManager:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         pending_session_ids: List[str] = []
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        db = await get_db(self.db_path)
+        try:
             async with db.execute(
                 """SELECT id FROM auth_sessions
                    WHERE provider_id = ? AND status IN (?, ?)""",
@@ -365,6 +380,8 @@ class AuthFlowManager:
             ) as cursor:
                 rows = await cursor.fetchall()
                 pending_session_ids = [item["id"] for item in rows]
+        finally:
+            await db.close()
 
         for auth_session_id in pending_session_ids:
             await self.cancel_flow(auth_session_id, reason=reason)
@@ -428,7 +445,8 @@ class AuthFlowManager:
         # 格式: code_verifier::client_id_real::client_secret_real
         packed = f"{code_verifier}::{client_id_real}::{client_secret_real}"
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """INSERT INTO auth_sessions
                    (id, provider_id, flow_type, status, verification_uri, user_code,
@@ -442,7 +460,7 @@ class AuthFlowManager:
                     STATUS_PENDING,
                     auth_url,
                     "",                          # user_code 为空（无需手动输入）
-                    _obfuscate(packed),           # 敏感数据
+                    encrypt_sensitive_value(packed),           # 敏感数据
                     sso_start_url,               # 复用 client_id 字段
                     sso_region,                  # 复用 client_secret 字段
                     5,
@@ -452,8 +470,11 @@ class AuthFlowManager:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         # 内存缓存（同步备份）
+        self._active_provider_flows[provider_id] = auth_session_id
         self._pkce_ctx[auth_session_id] = {
             "client_id_real": client_id_real,
             "client_secret_real": client_secret_real,
@@ -502,7 +523,7 @@ class AuthFlowManager:
         auth_session_id = row["id"]
         ctx = self._pkce_ctx.get(auth_session_id)
         if ctx is None:
-            packed_raw = _deobfuscate(row["device_code"]) if row["device_code"] else ""
+            packed_raw = decrypt_sensitive_value(row["device_code"]) if row["device_code"] else ""
             parts = packed_raw.split("::", 2)
             if len(parts) != 3:
                 raise ValueError("PKCE session state is corrupted")
@@ -549,7 +570,8 @@ class AuthFlowManager:
             accounts = []
 
         now = int(time.time())
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """UPDATE auth_sessions SET
                     status = ?, access_token = ?,
@@ -557,13 +579,15 @@ class AuthFlowManager:
                    WHERE id = ?""",
                 (
                     STATUS_AWAITING_ROLE,
-                    _obfuscate(access_token),
+                    encrypt_sensitive_value(access_token),
                     json.dumps(accounts),
                     now,
                     auth_session_id,
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         self._pkce_ctx.pop(auth_session_id, None)
         logger.info("PKCE callback completed for session %s", auth_session_id)
@@ -703,9 +727,11 @@ class AuthFlowManager:
         interval = auth_resp.get("interval", 5)
 
         auth_session_id = str(uuid.uuid4())
+        self._active_provider_flows[provider_id] = auth_session_id
         now = int(time.time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """INSERT INTO auth_sessions
                    (id, provider_id, flow_type, status, verification_uri, user_code,
@@ -719,7 +745,7 @@ class AuthFlowManager:
                     STATUS_PENDING,
                     verification_uri,
                     user_code,
-                    _obfuscate(device_code),
+                    encrypt_sensitive_value(device_code),
                     # 复用 client_id/client_secret 字段存 sso_start_url/sso_region
                     sso_start_url,
                     sso_region,
@@ -730,6 +756,8 @@ class AuthFlowManager:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         # 启动后台轮询
         self._start_poll_task(auth_session_id, FLOW_AWS_IAM, {
@@ -837,9 +865,11 @@ class AuthFlowManager:
         interval = data.get("interval", 5)
 
         auth_session_id = str(uuid.uuid4())
+        self._active_provider_flows[provider_id] = auth_session_id
         now = int(time.time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """INSERT INTO auth_sessions
                    (id, provider_id, flow_type, status, verification_uri, user_code,
@@ -853,9 +883,9 @@ class AuthFlowManager:
                     STATUS_PENDING,
                     verification_uri,
                     user_code,
-                    _obfuscate(device_code),
+                    encrypt_sensitive_value(device_code),
                     effective_client_id,
-                    _obfuscate(client_secret or ""),
+                    encrypt_sensitive_value(client_secret or ""),
                     interval,
                     now + expires_in,
                     now,
@@ -863,6 +893,8 @@ class AuthFlowManager:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         self._start_poll_task(auth_session_id, flow_type, {
             "client_id": effective_client_id,
@@ -904,6 +936,7 @@ class AuthFlowManager:
             raise ValueError("client_id is required for browser_oauth flow")
 
         auth_session_id = str(uuid.uuid4())
+        self._active_provider_flows[provider_id] = auth_session_id
         code_verifier = secrets.token_urlsafe(48)
         code_challenge = base64.urlsafe_b64encode(
             hashlib.sha256(code_verifier.encode("utf-8")).digest()
@@ -934,7 +967,8 @@ class AuthFlowManager:
 
         now = int(time.time())
         expires_in = 900
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """INSERT INTO auth_sessions
                    (id, provider_id, flow_type, status, verification_uri, user_code,
@@ -949,7 +983,7 @@ class AuthFlowManager:
                     verification_uri,
                     "请在浏览器登录...",
                     client_id,
-                    _obfuscate(client_secret or ""),
+                    encrypt_sensitive_value(client_secret or ""),
                     2,
                     now + expires_in,
                     context_json,
@@ -958,7 +992,10 @@ class AuthFlowManager:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
+        self._active_provider_flows[provider_id] = auth_session_id
         self._pkce_ctx[auth_session_id] = json.loads(context_json)
         return FlowStartResult(
             auth_session_id=auth_session_id,
@@ -1009,7 +1046,8 @@ class AuthFlowManager:
 
         now = int(time.time())
         expires_at = now + 900
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """INSERT INTO auth_sessions
                    (id, provider_id, flow_type, status, verification_uri,
@@ -1021,10 +1059,14 @@ class AuthFlowManager:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
-        task = self._start_openai_callback_listener(auth_session_id, provider_id)
-        self._interactive_tasks[auth_session_id] = task
-        task.add_done_callback(lambda _: self._interactive_tasks.pop(auth_session_id, None))
+        self._active_provider_flows[provider_id] = auth_session_id
+        if self.start_interactive_listeners:
+            task = self._start_openai_callback_listener(auth_session_id, provider_id)
+            self._interactive_tasks[auth_session_id] = task
+            task.add_done_callback(lambda _: self._interactive_tasks.pop(auth_session_id, None))
 
         return FlowStartResult(
             auth_session_id=auth_session_id,
@@ -1110,8 +1152,13 @@ try {{
         except asyncio.CancelledError:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2)
             raise
 
         row = await self._load_auth_session(auth_session_id)
@@ -1317,7 +1364,8 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
                 accounts = []
 
             now = int(time.time())
-            async with aiosqlite.connect(self.db_path) as db:
+            db = await get_db(self.db_path)
+            try:
                 await db.execute(
                     """UPDATE auth_sessions SET
                         status = ?, access_token = ?, refresh_token = ?,
@@ -1325,8 +1373,8 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
                        WHERE id = ?""",
                     (
                         STATUS_AWAITING_ROLE,
-                        _obfuscate(access_token),
-                        _obfuscate(refresh_token) if refresh_token else None,
+                        encrypt_sensitive_value(access_token),
+                        encrypt_sensitive_value(refresh_token) if refresh_token else None,
                         token_expires_at,
                         json.dumps(accounts),
                         now,
@@ -1334,6 +1382,8 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
                     ),
                 )
                 await db.commit()
+            finally:
+                await db.close()
             return True
 
         body = resp.json() if resp.content else {}
@@ -1425,12 +1475,15 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
         )
         auth_json = json.dumps(serialize_auth_config(auth_config), ensure_ascii=False)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 "UPDATE provider_configs SET auth_type = ?, auth_config = ? WHERE id = ?",
                 (AuthType.OAUTH.value, auth_json, provider_id),
             )
             await db.commit()
+        finally:
+            await db.close()
         logger.info("OAuth token written to provider %s", provider_id)
 
     async def _write_sigv4_to_provider(
@@ -1450,19 +1503,22 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
             metadata={
                 **metadata,
                 "accessKeyId": sigv4.get("accessKeyId", ""),
-                "secretAccessKey": _obfuscate(sigv4.get("secretAccessKey", "")),
-                "sessionToken": _obfuscate(sigv4.get("sessionToken", "")),
-                "sso_access_token": _obfuscate(access_token),
+                "secretAccessKey": encrypt_sensitive_value(sigv4.get("secretAccessKey", "")),
+                "sessionToken": encrypt_sensitive_value(sigv4.get("sessionToken", "")),
+                "sso_access_token": encrypt_sensitive_value(access_token),
             },
         )
         auth_json = json.dumps(serialize_auth_config(auth_config), ensure_ascii=False)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 "UPDATE provider_configs SET auth_type = ?, auth_config = ? WHERE id = ?",
                 (AuthType.IAM.value, auth_json, provider_id),
             )
             await db.commit()
+        finally:
+            await db.close()
         logger.info("Sigv4 credentials written to provider %s", provider_id)
 
     async def _complete_oauth_session(
@@ -1477,7 +1533,8 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
         token_expires_at = int(time.time()) + expires_in
         now = int(time.time())
 
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 """UPDATE auth_sessions SET
                     status = ?, access_token = ?, refresh_token = ?,
@@ -1485,14 +1542,16 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
                    WHERE id = ?""",
                 (
                     STATUS_COMPLETED,
-                    _obfuscate(access_token),
-                    _obfuscate(refresh_token) if refresh_token else None,
+                    encrypt_sensitive_value(access_token),
+                    encrypt_sensitive_value(refresh_token) if refresh_token else None,
                     token_expires_at,
                     now,
                     auth_session_id,
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
 
         await self._write_oauth_token_to_provider(
             provider_id,
@@ -1525,21 +1584,29 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
     # ------------------------------------------------------------------
 
     async def _load_auth_session(self, auth_session_id: str) -> Optional[Any]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        db = await get_db(self.db_path)
+        try:
             async with db.execute(
                 "SELECT * FROM auth_sessions WHERE id = ?", (auth_session_id,)
             ) as cursor:
                 return await cursor.fetchone()
+        finally:
+            await db.close()
 
     async def _load_provider_row(self, provider_id: str) -> Optional[Any]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        db = await get_db(self.db_path)
+        try:
             async with db.execute(
                 "SELECT * FROM provider_configs WHERE id = ?",
                 (provider_id,),
             ) as cursor:
                 return await cursor.fetchone()
+        finally:
+            await db.close()
+
+    def _cleanup_provider_flow(self, provider_id: str, auth_session_id: str) -> None:
+        if self._active_provider_flows.get(provider_id) == auth_session_id:
+            self._active_provider_flows.pop(provider_id, None)
 
     async def _load_provider_auth_config(self, provider_id: str) -> AuthConfig:
         row = await self._load_provider_row(provider_id)
@@ -1569,9 +1636,16 @@ h2{{color:{color};}}p{{color:#94a3b8;}}</style>
         error_message: Optional[str] = None,
     ) -> None:
         now = int(time.time())
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await get_db(self.db_path)
+        try:
             await db.execute(
                 "UPDATE auth_sessions SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
                 (status, error_message, now, auth_session_id),
             )
             await db.commit()
+        finally:
+            await db.close()
+        if status in (STATUS_COMPLETED, STATUS_FAILED, STATUS_EXPIRED, STATUS_CANCELLED):
+            row = await self._load_auth_session(auth_session_id)
+            if row is not None:
+                self._cleanup_provider_flow(row["provider_id"], auth_session_id)

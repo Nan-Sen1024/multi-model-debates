@@ -112,6 +112,36 @@ export async function updateSession(
   });
 }
 
+export async function updateSessionWorkspaceCanWrite(
+  sessionId: string,
+  canWrite: boolean,
+): Promise<SessionDetail> {
+  return request<SessionDetail>(`/sessions/${sessionId}/workspace/can-write`, {
+    method: "PATCH",
+    body: JSON.stringify({ can_write: canWrite }),
+  });
+}
+
+export async function appendSessionParticipant(
+  sessionId: string,
+  payload: ParticipantConfig,
+): Promise<SessionDetail> {
+  return request<SessionDetail>(`/sessions/${sessionId}/participants`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function appendSessionParticipants(
+  sessionId: string,
+  participants: ParticipantConfig[],
+): Promise<SessionDetail> {
+  return request<SessionDetail>(`/sessions/${sessionId}/participants/batch`, {
+    method: "POST",
+    body: JSON.stringify({ participants }),
+  });
+}
+
 export async function deleteSession(
   sessionId: string,
 ): Promise<{ reason: string; summary: string }> {
@@ -252,6 +282,7 @@ export function openSessionStream(
   const terminalEvents = new Set(["round_end", "session_end", "error"]);
   let closed = false;
   let terminalEventSeen = false;
+  let nonPingEventSeen = false;
 
   const bind = (eventName: string) => {
     source.addEventListener(eventName, (event) => {
@@ -259,6 +290,9 @@ export function openSessionStream(
       if (typeof messageEvent.data !== "string") return;
       try {
         const payload = JSON.parse(messageEvent.data) as StreamPayload;
+        if (eventName !== "ping") {
+          nonPingEventSeen = true;
+        }
         if (terminalEvents.has(eventName)) {
           terminalEventSeen = true;
         }
@@ -270,11 +304,20 @@ export function openSessionStream(
   [
     "ping",
     "turn_start",
+    "phase_start",
+    "phase_end",
     "chunk",
+    "reasoning_note",
+    "model_request",
+    "model_output",
+    "model_response",
     "agent_plan",
     "tool_call",
+    "tool_output",
     "tool_result",
+    "state_write",
     "turn_end",
+    "participant_error",
     "round_end",
     "drift_alert",
     "compression",
@@ -287,7 +330,10 @@ export function openSessionStream(
       return;
     }
     onEvent("error", {
-      message: "SSE 连接中断，请检查后端服务状态。",
+      code: nonPingEventSeen ? "SSE_INTERRUPTED_AFTER_PROGRESS" : "SSE_CONNECTION_FAILED",
+      message: nonPingEventSeen
+        ? "SSE 连接在执行过程中中断，后端可能被热重载或重启。已刷新会话历史，请检查后端日志和最新工具输出。"
+        : "SSE 连接中断，请检查后端服务状态。",
     });
   };
 

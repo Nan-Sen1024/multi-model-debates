@@ -75,7 +75,47 @@ describe("openSessionStream", () => {
     expect(received).toEqual([
       {
         event: "error",
-        payload: { message: "SSE 连接中断，请检查后端服务状态。" },
+        payload: {
+          code: "SSE_CONNECTION_FAILED",
+          message: "SSE 连接中断，请检查后端服务状态。",
+        },
+      },
+    ]);
+  });
+
+  test("emits a reload-oriented transport error after stream progress", () => {
+    const received: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    openSessionStream("session-progress", (event, payload) => {
+      received.push({ event, payload: payload as Record<string, unknown> });
+    });
+
+    MockEventSource.instances[0].emit("tool_result", {
+      participant_id: "claude",
+      server_name: "workspace",
+      tool_name: "write_file",
+      text: "Wrote 123 characters to backend/api.py",
+      round: 61,
+    });
+    MockEventSource.instances[0].emitError();
+
+    expect(received).toEqual([
+      {
+        event: "tool_result",
+        payload: {
+          participant_id: "claude",
+          server_name: "workspace",
+          tool_name: "write_file",
+          text: "Wrote 123 characters to backend/api.py",
+          round: 61,
+        },
+      },
+      {
+        event: "error",
+        payload: {
+          code: "SSE_INTERRUPTED_AFTER_PROGRESS",
+          message: "SSE 连接在执行过程中中断，后端可能被热重载或重启。已刷新会话历史，请检查后端日志和最新工具输出。",
+        },
       },
     ]);
   });
@@ -133,6 +173,11 @@ describe("openSessionStream", () => {
       tool_name: "list_directory",
       round: 1,
     });
+    MockEventSource.instances[0].emit("model_output", {
+      participant_id: "claude",
+      content: "{\"action\":\"tool_call\"",
+      round: 1,
+    });
     MockEventSource.instances[0].emit("tool_result", {
       participant_id: "claude",
       server_name: "filesystem",
@@ -156,6 +201,14 @@ describe("openSessionStream", () => {
           participant_id: "claude",
           server_name: "filesystem",
           tool_name: "list_directory",
+          round: 1,
+        },
+      },
+      {
+        event: "model_output",
+        payload: {
+          participant_id: "claude",
+          content: "{\"action\":\"tool_call\"",
           round: 1,
         },
       },
@@ -197,11 +250,80 @@ describe("openSessionStream", () => {
     ]);
   });
 
+  test("forwards execution telemetry phase and state events", () => {
+    const received: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    openSessionStream("session-6", (event, payload) => {
+      received.push({ event, payload: payload as Record<string, unknown> });
+    });
+
+    MockEventSource.instances[0].emit("phase_start", {
+      participant_id: "claude",
+      round: 2,
+      phase: "build_prompt",
+      summary: "构建工作区上下文",
+    });
+    MockEventSource.instances[0].emit("state_write", {
+      participant_id: "claude",
+      round: 2,
+      target: "message",
+      summary: "已写入参与者消息",
+    });
+
+    expect(received).toEqual([
+      {
+        event: "phase_start",
+        payload: {
+          participant_id: "claude",
+          round: 2,
+          phase: "build_prompt",
+          summary: "构建工作区上下文",
+        },
+      },
+      {
+        event: "state_write",
+        payload: {
+          participant_id: "claude",
+          round: 2,
+          target: "message",
+          summary: "已写入参与者消息",
+        },
+      },
+    ]);
+  });
+
   test("bypasses the CRA dev proxy for SSE in local development", () => {
     openSessionStream("session-dev", () => {});
 
     expect(MockEventSource.instances[0].url).toBe(
       "http://127.0.0.1:8000/api/sessions/session-dev/stream",
     );
+  });
+
+  test("forwards participant_error events", () => {
+    const received: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    openSessionStream("session-7", (event, payload) => {
+      received.push({ event, payload: payload as Record<string, unknown> });
+    });
+
+    MockEventSource.instances[0].emit("participant_error", {
+      participant_id: "claude",
+      round: 3,
+      code: "PROVIDER_UNAVAILABLE",
+      message: "provider down",
+    });
+
+    expect(received).toEqual([
+      {
+        event: "participant_error",
+        payload: {
+          participant_id: "claude",
+          round: 3,
+          code: "PROVIDER_UNAVAILABLE",
+          message: "provider down",
+        },
+      },
+    ]);
   });
 });

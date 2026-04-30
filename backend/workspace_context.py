@@ -9,7 +9,7 @@ from .workspace_skills import (
     render_workspace_skill_context,
     select_workspace_skills_for_participant,
 )
-from .workspace_scanner import WorkspaceScanResult
+from .workspace_scanner import WorkspaceScanResult, _resolve_workspace_root
 
 DEFAULT_WORKSPACE_CONTEXT_FILE_LIMIT = 12
 MAX_WORKSPACE_CONTEXT_FILE_LIMIT = 24
@@ -207,7 +207,7 @@ def _workspace_skill_source_prefixes(session: Session) -> Set[str]:
     if workspace is None or workspace.capabilities is None:
         return set()
 
-    workspace_root = Path(workspace.root_path).expanduser().resolve()
+    workspace_root = _resolve_workspace_root(workspace.root_path).resolve()
     prefixes: Set[str] = set()
     for source in workspace.capabilities.skill_sources:
         configured = str(source.path).strip()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import os
 import json
 import time
 import uuid
@@ -14,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .database import DB_PATH, init_db
+from .database import DB_PATH, get_db, init_db
 from .enums import APIFormat, AuthType, CollaborationMode, ProviderType
 from .exceptions import ValidationError
 from .auth_flow import (
@@ -36,12 +38,19 @@ from .models import AuthConfig, ProviderConfig, WorkspaceConfig
 from .workspace_reader import read_workspace_file
 from .workspace_scanner import scan_workspace
 from .workspace_capabilities import workspace_capabilities_from_dict, workspace_capabilities_to_dict
-from .orchestrator import CreateSessionRequest, ParticipantInput, SessionOrchestrator
+from .orchestrator import CreateSessionRequest, ParticipantInput, SessionOrchestrator, StreamChunk
 
 app = FastAPI(title="Multi-Model Debate Backend")
+logger = logging.getLogger(__name__)
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -55,6 +64,14 @@ class ParticipantPayload(BaseModel):
     provider_id: Optional[str] = None
     custom_id: Optional[str] = None
     role_desc: Optional[str] = None
+
+
+class ParticipantBatchPayload(BaseModel):
+    participants: List[ParticipantPayload] = Field(default_factory=list)
+
+
+class ParticipantRenamePayload(BaseModel):
+    new_custom_id: str
 
 
 class SessionCreatePayload(BaseModel):
@@ -87,6 +104,19 @@ class RestorePayload(BaseModel):
 
 class SessionPatchPayload(BaseModel):
     title: Optional[str] = None
+
+
+class SessionConfigPatchPayload(BaseModel):
+    default_model_ref: Optional[str] = None
+
+
+class SessionClonePayload(BaseModel):
+    topic: Optional[str] = None
+    mode: Optional[CollaborationMode] = None
+
+
+class WorkspaceWriteModePatchPayload(BaseModel):
+    can_write: bool
 
 
 class WorkspacePayload(BaseModel):
@@ -164,6 +194,30 @@ class ProviderPayload(BaseModel):
 
 def error_response(exc: ValidationError, status_code: int = 400) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=exc.to_dict())
+
+
+def _session_payload(session) -> Dict[str, Any]:
+    return {
+        "id": session.id,
+        "title": session.config.display_title or session.topic,
+        "topic": session.topic,
+        "mode": session.mode.value,
+        "status": session.status.value,
+        "current_round": session.current_round,
+        "default_model_ref": session.config.default_model_ref,
+        "workspace": _workspace_config_payload(session.config.workspace),
+        "participants": [
+            {
+                "id": participant.id,
+                "custom_id": participant.custom_id,
+                "model_ref": participant.model_ref,
+                "provider_id": participant.provider_id,
+                "role_desc": participant.role_desc,
+                "is_active": participant.is_active,
+            }
+            for participant in session.participants
+        ],
+    }
 
 
 def _build_auth_config(auth_type: AuthType, auth_value: Optional[str], auth_metadata: Dict[str, Any]) -> AuthConfig:
@@ -290,10 +344,12 @@ def _provider_config_from_payload(provider_id: str, payload: ProviderPayload) ->
 
 async def _load_provider_config(provider_id: str) -> Optional[ProviderConfig]:
     await init_db(DB_PATH)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    db = await get_db(DB_PATH)
+    try:
         async with db.execute("SELECT * FROM provider_configs WHERE id = ? LIMIT 1", (provider_id,)) as cursor:
             row = await cursor.fetchone()
+    finally:
+        await db.close()
     if row is None:
         return None
     return _provider_config_from_row(row)
@@ -387,26 +443,7 @@ async def list_sessions():
 async def get_session(session_id: str):
     try:
         session = await orchestrator.get_session(session_id)
-        return {
-            "id": session.id,
-            "title": session.config.display_title or session.topic,
-            "topic": session.topic,
-            "mode": session.mode.value,
-            "status": session.status.value,
-            "current_round": session.current_round,
-            "workspace": _workspace_config_payload(session.config.workspace),
-            "participants": [
-                {
-                    "id": participant.id,
-                    "custom_id": participant.custom_id,
-                    "model_ref": participant.model_ref,
-                    "provider_id": participant.provider_id,
-                    "role_desc": participant.role_desc,
-                    "is_active": participant.is_active,
-                }
-                for participant in session.participants
-            ],
-        }
+        return _session_payload(session)
     except ValidationError as exc:
         return error_response(exc, 404)
 
@@ -415,28 +452,115 @@ async def get_session(session_id: str):
 async def patch_session(session_id: str, payload: SessionPatchPayload):
     try:
         session = await orchestrator.update_session_title(session_id, payload.title)
-        return {
-            "id": session.id,
-            "title": session.config.display_title or session.topic,
-            "topic": session.topic,
-            "mode": session.mode.value,
-            "status": session.status.value,
-            "current_round": session.current_round,
-            "workspace": _workspace_config_payload(session.config.workspace),
-            "participants": [
-                {
-                    "id": participant.id,
-                    "custom_id": participant.custom_id,
-                    "model_ref": participant.model_ref,
-                    "provider_id": participant.provider_id,
-                    "role_desc": participant.role_desc,
-                    "is_active": participant.is_active,
-                }
-                for participant in session.participants
-            ],
-        }
+        return _session_payload(session)
     except ValidationError as exc:
         return error_response(exc, 404)
+
+
+@app.patch("/api/sessions/{session_id}/config")
+async def patch_session_config(session_id: str, payload: SessionConfigPatchPayload):
+    try:
+        session = await orchestrator.update_session_default_model(session_id, payload.default_model_ref)
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        return error_response(exc)
+
+
+@app.patch("/api/sessions/{session_id}/workspace/can-write")
+async def patch_session_workspace_can_write(session_id: str, payload: WorkspaceWriteModePatchPayload):
+    try:
+        session = await orchestrator.update_workspace_can_write(session_id, payload.can_write)
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        if exc.field == "workspace":
+            return error_response(exc, 400)
+        return error_response(exc)
+
+
+@app.post("/api/sessions/{session_id}/participants")
+async def append_session_participant(session_id: str, payload: ParticipantPayload):
+    try:
+        session = await orchestrator.append_participant(
+            session_id,
+            ParticipantInput(
+                model_ref=payload.model_ref,
+                provider_id=payload.provider_id,
+                custom_id=payload.custom_id,
+                role_desc=payload.role_desc,
+            ),
+        )
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        if exc.field in {"session_state", "session_status"}:
+            return error_response(exc, 409)
+        return error_response(exc)
+
+
+@app.post("/api/sessions/{session_id}/participants/batch")
+async def append_session_participants_batch(session_id: str, payload: ParticipantBatchPayload):
+    try:
+        session = await orchestrator.append_participants(
+            session_id,
+            [
+                ParticipantInput(
+                    model_ref=item.model_ref,
+                    provider_id=item.provider_id,
+                    custom_id=item.custom_id,
+                    role_desc=item.role_desc,
+                )
+                for item in payload.participants
+            ],
+        )
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        if exc.field in {"session_state", "session_status"}:
+            return error_response(exc, 409)
+        return error_response(exc)
+
+
+@app.patch("/api/sessions/{session_id}/participants/{custom_id}")
+async def rename_session_participant(session_id: str, custom_id: str, payload: ParticipantRenamePayload):
+    try:
+        session = await orchestrator.rename_participant(session_id, custom_id, payload.new_custom_id)
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        if exc.field in {"session_state", "session_status"}:
+            return error_response(exc, 409)
+        return error_response(exc)
+
+
+@app.delete("/api/sessions/{session_id}/participants/{custom_id}")
+async def remove_session_participant(session_id: str, custom_id: str):
+    try:
+        session = await orchestrator.remove_participant(session_id, custom_id)
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        if exc.field in {"session_state", "session_status"}:
+            return error_response(exc, 409)
+        return error_response(exc)
+
+
+@app.post("/api/sessions/{session_id}/clone")
+async def clone_session(session_id: str, payload: SessionClonePayload):
+    try:
+        session = await orchestrator.clone_session(session_id, topic=payload.topic, mode=payload.mode)
+        return _session_payload(session)
+    except ValidationError as exc:
+        if exc.field == "session_id":
+            return error_response(exc, 404)
+        return error_response(exc)
 
 
 @app.get("/api/sessions/{session_id}/workspace")
@@ -555,6 +679,19 @@ async def stream_session(session_id: str):
     def format_stream_chunk(event: str, payload: Dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+    def format_error_chunk(exc: Exception) -> StreamChunk:
+        if isinstance(exc, ValidationError):
+            payload = exc.to_dict()["error"]
+        else:
+            logger.exception("SSE session stream failed for %s", session_id)
+            payload = {
+                "code": "STREAM_ERROR",
+                "message": "SSE 流处理失败，请重试。",
+                "field": None,
+                "session_id": session_id,
+            }
+        return StreamChunk("error", metadata=payload)
+
     async def event_stream():
         queue: asyncio.Queue[object] = asyncio.Queue()
         sentinel = object()
@@ -564,7 +701,7 @@ async def stream_session(session_id: str):
                 async for chunk in orchestrator.dispatch_round(session_id):
                     await queue.put(chunk)
             except Exception as exc:
-                await queue.put(exc)
+                await queue.put(format_error_chunk(exc))
             finally:
                 await queue.put(sentinel)
 
@@ -585,9 +722,10 @@ async def stream_session(session_id: str):
                 if item is sentinel:
                     break
                 if isinstance(item, Exception):
-                    raise item
+                    chunk = format_error_chunk(item)
+                else:
+                    chunk = item
 
-                chunk = item
                 yield format_stream_chunk(
                     chunk.event,
                     {
@@ -607,7 +745,8 @@ async def stream_session(session_id: str):
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )

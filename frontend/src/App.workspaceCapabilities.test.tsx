@@ -38,7 +38,7 @@ describe("App workspace capability editor", () => {
     container.remove();
   });
 
-  test("shows capability editors in code workspace mode", async () => {
+  test("keeps advanced workspace controls collapsed until expanded", async () => {
     jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const path = String(input);
       if (path === "/api/providers") {
@@ -76,10 +76,194 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
-    expect(container.textContent).toContain("Skills");
-    expect(container.textContent).toContain("MCP");
-    expect(container.textContent).toContain("Agent");
-    expect(container.textContent).toContain("参与者覆盖");
+    const rootPathInput = container.querySelector('input[placeholder*="multi-model-debates"]') as HTMLInputElement | null;
+    expect(rootPathInput).not.toBeNull();
+    const canWriteInput = container.querySelector(
+      'input[name="workspace-agent-can-write"]',
+    ) as HTMLInputElement | null;
+    expect(canWriteInput).not.toBeNull();
+    expect(container.textContent).toContain("允许 AI 修改文件并运行命令");
+    expect(container.querySelector('textarea[name="workspace-skill-sources"]')).toBeNull();
+    expect(container.querySelector('input[name="workspace-mcp-name-0"]')).toBeNull();
+    expect(container.querySelector('select[name="workspace-agent-mode"]')).toBeNull();
+    expect(container.querySelector('textarea[name="workspace-override-skills-Model_A"]')).toBeNull();
+
+    const advancedToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("高级配置"),
+    ) as HTMLButtonElement | undefined;
+    expect(advancedToggle).toBeDefined();
+
+    await act(async () => {
+      advancedToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('textarea[name="workspace-skill-sources"]')).not.toBeNull();
+    expect(container.querySelector('input[name="workspace-mcp-name-0"]')).not.toBeNull();
+    expect(container.querySelector('select[name="workspace-agent-mode"]')).not.toBeNull();
+    expect(container.querySelector('textarea[name="workspace-override-skills-Model_A"]')).not.toBeNull();
+  });
+
+  test("submits a minimal workspace capability manifest for default code workspace sessions", async () => {
+    let createSessionBody: Record<string, unknown> | null = null;
+
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions" && !init?.method) {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions" && init?.method === "POST") {
+        createSessionBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return mockJsonResponse({
+          id: "workspace-default-session",
+          status: "active",
+          mode: "code_workspace",
+        });
+      }
+      if (path === "/api/sessions/workspace-default-session") {
+        return mockJsonResponse({
+          id: "workspace-default-session",
+          title: "workspace",
+          topic: "默认工作区",
+          mode: "code_workspace",
+          status: "active",
+          current_round: 0,
+          workspace: {
+            root_path: "D:/repo/default",
+            display_name: "default-repo",
+            repo_fingerprint: null,
+            scan_excludes: [],
+            selected_paths: [],
+            index_status: "pending",
+            last_scanned_at: null,
+            summary: null,
+            capabilities: {
+              skill_sources: [],
+              mcp_servers: [],
+              agent_defaults: {
+                mode: "tool_loop",
+                max_steps: 6,
+                can_write: false,
+                allowed_skills: [],
+                allowed_mcp_servers: [],
+                memory_scope: "workspace_shared",
+              },
+              participant_overrides: {},
+            },
+          },
+          participants: [
+            { id: "p1", custom_id: "Model_A", model_ref: "anthropic/claude-4.6", is_active: true },
+            { id: "p2", custom_id: "Model_B", model_ref: "openai/gpt-5.4", is_active: true },
+          ],
+        });
+      }
+      if (path === "/api/sessions/workspace-default-session/snapshot") {
+        return mockJsonResponse({
+          topic: "默认工作区",
+          mode: "code_workspace",
+          participant_summaries: {},
+          consensus_list: [],
+          key_events: [],
+        });
+      }
+      if (path === "/api/sessions/workspace-default-session/workspace") {
+        return mockJsonResponse({
+          root_path: "D:/repo/default",
+          display_name: "default-repo",
+          repo_fingerprint: "fingerprint-default",
+          scan_excludes: [],
+          selected_paths: [],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "workspace ready",
+          files: [],
+          tree: [],
+          capabilities: {
+            skill_sources: [],
+            mcp_servers: [],
+            agent_defaults: {
+              mode: "tool_loop",
+              max_steps: 6,
+              can_write: false,
+              allowed_skills: [],
+              allowed_mcp_servers: [],
+              memory_scope: "workspace_shared",
+            },
+            participant_overrides: {},
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("创建会话"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const workspaceCard = Array.from(container.querySelectorAll(".mode-card")).find((node) =>
+      node.textContent?.includes("代码工作区"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      workspaceCard?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const rootPathInput = container.querySelector(
+      'input[placeholder*="multi-model-debates"]',
+    ) as HTMLInputElement | null;
+    expect(rootPathInput).not.toBeNull();
+
+    await act(async () => {
+      Simulate.change(rootPathInput!, { target: { value: "D:/repo/default" } });
+      await Promise.resolve();
+    });
+
+    const submitButton = Array.from(container.querySelectorAll("button")).find(
+      (node) => node.textContent?.trim() === "🚀 创建会话",
+    ) as HTMLButtonElement | undefined;
+    expect(submitButton).toBeDefined();
+
+    await act(async () => {
+      submitButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(createSessionBody).not.toBeNull();
+    expect(createSessionBody).toMatchObject({
+      mode: "code_workspace",
+      workspace: {
+        root_path: "D:/repo/default",
+        capabilities: {
+          skill_sources: [],
+          mcp_servers: [],
+          agent_defaults: {
+            mode: "tool_loop",
+            max_steps: 6,
+            can_write: false,
+            allowed_skills: [],
+            allowed_mcp_servers: [],
+            memory_scope: "workspace_shared",
+          },
+          participant_overrides: {},
+        },
+      },
+    });
   });
 
   test("submits workspace capabilities when creating a code workspace session", async () => {
@@ -213,6 +397,16 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
+    const advancedToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("高级配置"),
+    ) as HTMLButtonElement | undefined;
+    expect(advancedToggle).toBeDefined();
+
+    await act(async () => {
+      advancedToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
     const rootPathInput = container.querySelector(
       'input[placeholder*="multi-model-debates"]',
     ) as HTMLInputElement | null;
@@ -237,6 +431,9 @@ describe("App workspace capability editor", () => {
     const agentModeSelect = container.querySelector(
       'select[name="workspace-agent-mode"]',
     ) as HTMLSelectElement | null;
+    const canWriteInput = container.querySelector(
+      'input[name="workspace-agent-can-write"]',
+    ) as HTMLInputElement | null;
     const agentMaxStepsInput = container.querySelector(
       'input[name="workspace-agent-max-steps"]',
     ) as HTMLInputElement | null;
@@ -272,6 +469,7 @@ describe("App workspace capability editor", () => {
     ) as HTMLInputElement | null;
 
     expect(rootPathInput).not.toBeNull();
+    expect(canWriteInput).not.toBeNull();
     expect(skillSourcesInput).not.toBeNull();
     expect(mcpNameInput).not.toBeNull();
     expect(agentModeSelect).not.toBeNull();
@@ -282,6 +480,7 @@ describe("App workspace capability editor", () => {
 
     await act(async () => {
       Simulate.change(rootPathInput!, { target: { value: "D:/repo/demo" } });
+      Simulate.change(canWriteInput!, { target: { checked: true } });
       Simulate.change(skillSourcesInput!, { target: { value: ".codex/skills" } });
       Simulate.change(mcpNameInput!, { target: { value: "filesystem" } });
       Simulate.change(mcpCommandInput!, { target: { value: "npx" } });
@@ -339,6 +538,7 @@ describe("App workspace capability editor", () => {
           agent_defaults: {
             mode: "tool_loop",
             max_steps: 4,
+            can_write: true,
             allowed_skills: ["repo-review"],
             allowed_mcp_servers: ["filesystem"],
           },
@@ -400,14 +600,24 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
+    const advancedToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("高级配置"),
+    ) as HTMLButtonElement | undefined;
+    expect(advancedToggle).toBeDefined();
+
+    await act(async () => {
+      advancedToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
     const agentModeSelect = container.querySelector(
       'select[name="workspace-agent-mode"]',
     ) as HTMLSelectElement | null;
+    const canWriteInput = container.querySelector(
+      'input[name="workspace-agent-can-write"]',
+    ) as HTMLInputElement | null;
     const agentMaxStepsInput = container.querySelector(
       'input[name="workspace-agent-max-steps"]',
-    ) as HTMLInputElement | null;
-    const agentCanWriteInput = container.querySelector(
-      'input[name="workspace-agent-can-write"]',
     ) as HTMLInputElement | null;
     const agentSkillsInput = container.querySelector(
       'textarea[name="workspace-agent-skills"]',
@@ -423,11 +633,12 @@ describe("App workspace capability editor", () => {
     ) as HTMLButtonElement | undefined;
 
     expect(copyDefaultButton).toBeDefined();
+    expect(canWriteInput).not.toBeNull();
 
     await act(async () => {
+      Simulate.change(canWriteInput!, { target: { checked: true } });
       Simulate.change(agentModeSelect!, { target: { value: "full_agent" } });
       Simulate.change(agentMaxStepsInput!, { target: { value: "9" } });
-      Simulate.change(agentCanWriteInput!, { target: { checked: true } });
       Simulate.change(agentSkillsInput!, { target: { value: "repo-review\nfix-bugs" } });
       Simulate.change(agentServersInput!, { target: { value: "filesystem\nshell" } });
       Simulate.change(agentMemoryScopeInput!, { target: { value: "participant_private" } });

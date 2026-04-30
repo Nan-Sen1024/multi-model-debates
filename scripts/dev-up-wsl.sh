@@ -12,6 +12,31 @@ mkdir -p "$LOG_DIR" "$PID_DIR"
 
 "$ROOT_DIR/scripts/dev-selfcheck-wsl.sh"
 
+log_proxy_env() {
+  echo "[INFO] proxy env snapshot:"
+  for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy MMD_PROXY_URL CLASH_PROXY_URL; do
+    local value="${!key:-unset}"
+    echo "[INFO]   $key=${value}"
+  done
+}
+
+log_proxy_env
+
+if ! source "$ROOT_DIR/scripts/wsl-proxy-env.sh"; then
+  echo "[WARN] WSL proxy env was not configured automatically."
+  echo "[WARN] If Clash only listens on Windows 127.0.0.1, enable mirrored networking or allow LAN binding."
+fi
+
+log_proxy_env
+
+BACKEND_RELOAD="${MMD_BACKEND_RELOAD:-0}"
+BACKEND_CMD=("$ROOT_DIR/.venv/bin/python" -m uvicorn backend.api:app --host 0.0.0.0 --port 8000)
+if [[ "$BACKEND_RELOAD" == "1" || "$BACKEND_RELOAD" == "true" ]]; then
+  BACKEND_CMD+=(--reload)
+else
+  echo "[INFO] backend reload disabled; set MMD_BACKEND_RELOAD=1 for manual hot reload."
+fi
+
 start_service() {
   local name="$1"
   local pid_file="$2"
@@ -38,7 +63,7 @@ start_service \
   "backend" \
   "$BACKEND_PID_FILE" \
   "$LOG_DIR/backend.log" \
-  "$ROOT_DIR/.venv/bin/python" -m uvicorn backend.api:app --reload --host 0.0.0.0 --port 8000
+  "${BACKEND_CMD[@]}"
 
 start_service \
   "frontend" \

@@ -208,6 +208,18 @@ uvicorn backend.api:app --reload --host 127.0.0.1 --port 8000
 
 - `http://127.0.0.1:8000`
 
+WSL + Windows Clash 场景下，先执行一次：
+
+```bash
+source ./scripts/wsl-proxy-env.sh
+```
+
+或者直接用：
+
+```bash
+./scripts/dev-up-wsl.sh
+```
+
 ### 3) 安装并启动前端
 
 ```bash
@@ -1082,15 +1094,23 @@ Uvicorn running on http://127.0.0.1:8000
 
 ### 15.7 WSL 下如何配置代理环境变量
 
-示例：
+推荐直接让脚本自动探测并导出：
 
 ```bash
-export HTTP_PROXY=http://代理地址:端口
-export HTTPS_PROXY=http://代理地址:端口
-export NO_PROXY=127.0.0.1,localhost,::1
+source ./scripts/wsl-proxy-env.sh
 ```
 
-如果代理运行在 Windows 上，WSL 里要用 Windows 网关地址，而不一定是 `127.0.0.1`。
+或者直接启动开发脚本，它会先尝试配置代理环境再启动后端和前端：
+
+```bash
+./scripts/dev-up-wsl.sh
+```
+
+如果你的 Clash 只监听 Windows 的 `127.0.0.1:7897`，而 WSL 里访问不到它，这通常不是环境变量写错，而是 WSL 的网络模式问题。可选方案：
+
+- 开启 WSL mirrored networking
+- 或让 Clash 绑定到 Windows 网关 / LAN 地址
+- 或手动设置 `MMD_PROXY_URL=http://<可达地址>:7897`
 
 ---
 
@@ -1103,3 +1123,39 @@ export NO_PROXY=127.0.0.1,localhost,::1
 - `frontend/src/WorkspaceMode.tsx`
 
 它们基本覆盖了运行入口、调度主线、Provider 路由、前端状态和工作区能力。
+## 16. Terminal CLI
+
+安装后可以直接进入项目终端：
+
+```bash
+python -m pip install -e .
+mmd
+```
+
+常用入口：
+
+- `mmd` 直接进入默认 shell；如果当前工作区没有匹配到会话，会先创建一个新的工作区会话
+- `mmd shell` 显式进入同一个默认 shell 入口
+- `mmd sessions` 列出会话
+- `mmd attach <session_id>` 进入已有会话
+- `mmd new --goal "repair backend llm gateway" --workspace-root .` 创建新会话并进入
+- `mmd providers` 查看已接入 provider
+- `mmd models` 查看已发现的模型目录
+- `mmd models status` 查看当前会话默认模型和模型目录
+- `mmd models set openai/gpt-5.4` 设置当前会话默认模型，裸模型名也可以在只命中一个 provider 时自动绑定
+
+交互 shell 里常用命令：
+
+- 直接输入文本会发给当前会话
+- `@alias` 单独一行会切换当前焦点，后续普通文本会默认发给这个参与者
+- `/add reviewer` 会直接使用当前会话默认模型
+- `/add reviewer gpt-5.4` 给当前会话追加参与者
+- `/add reviewer openai/gpt-5.4` 也可以，`provider/model` 仍然是后台标准格式
+- `/to reviewer` 也可以切换焦点，`/to clear` 清除焦点
+- `/rename reviewer architect` 重命名参与者别名
+- `/remove reviewer` 移除参与者
+- `/clone` 复制当前会话并重新进入副本
+- 裸模型名只在当前只匹配到一个 provider 时自动绑定
+- `@alias` 大小写不敏感，且必须是当前会话里已有的参与者别名
+- `@all` 会广播给当前会话里所有活跃参与者
+- `/setup` 会走一个简化的快速配置流程，避免手写嵌套 JSON

@@ -268,6 +268,13 @@ describe("App code workspace mode", () => {
         round: 1,
         execution_mode: "agent",
       });
+      streamCallback?.("phase_start", {
+        participant_id: "claude",
+        round: 1,
+        phase: "scan_workspace",
+        summary: "扫描工作区",
+        file_count: 2,
+      });
       streamCallback?.("tool_call", {
         participant_id: "claude",
         round: 1,
@@ -298,10 +305,179 @@ describe("App code workspace mode", () => {
     });
 
     expect(container.textContent).toContain("正在查看 README");
-    expect(container.textContent).toContain("执行过程");
-    expect(container.textContent).toContain("claude 开始执行");
+    expect(container.textContent).toContain("实时执行日志");
+    expect(container.textContent).toContain("claude 执行完成");
+    expect(container.textContent).toContain("扫描工作区");
     expect(container.textContent).toContain("filesystem.read_file");
     expect(container.textContent).toContain("README 内容");
+    expect(container.querySelector('[data-execution-kind="phase"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-execution-kind="turn"]')).toHaveLength(1);
+  });
+
+  test("hydrates persisted assistant replies after round end when SSE emits no chunk", async () => {
+    localStorage.setItem("mmdebate.lastSessionId", "workspace-session");
+    let messageFetchCount = 0;
+
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([
+          {
+            id: "workspace-session",
+            title: "workspace",
+            topic: "评审本地仓库",
+            mode: "code_workspace",
+            status: "active",
+            current_round: 1,
+            updated_at: 300,
+            participant_count: 1,
+            last_message_preview: "assistant reply",
+          },
+        ]);
+      }
+      if (path === "/api/sessions/workspace-session") {
+        return mockJsonResponse({
+          id: "workspace-session",
+          title: "workspace",
+          topic: "评审本地仓库",
+          mode: "code_workspace",
+          status: "active",
+          current_round: 1,
+          participants: [
+            { id: "p1", custom_id: "g54", model_ref: "openai/gpt-5.4", is_active: true },
+          ],
+          workspace: {
+            root_path: "D:/repo/demo",
+            display_name: "demo-repo",
+            repo_fingerprint: "fingerprint-123",
+            scan_excludes: [],
+            selected_paths: ["README.md"],
+            index_status: "ready",
+            last_scanned_at: 1710000000,
+            summary: "2 个文件，1 个顶层目录/文件",
+          },
+        });
+      }
+      if (path === "/api/sessions/workspace-session/snapshot") {
+        return mockJsonResponse({
+          topic: "评审本地仓库",
+          mode: "code_workspace",
+          participant_summaries: {},
+          consensus_list: [],
+          key_events: [],
+        });
+      }
+      if (path === "/api/sessions/workspace-session/messages" && init?.method === "POST") {
+        return mockJsonResponse({ status: "queued" });
+      }
+      if (path === "/api/sessions/workspace-session/messages") {
+        messageFetchCount += 1;
+        if (messageFetchCount === 1) {
+          return mockJsonResponse([]);
+        }
+        return mockJsonResponse([
+          {
+            id: "user-msg-1",
+            sender_id: "[用户]",
+            message_type: "user_intervention",
+            content: "@g54 直接修复",
+            is_masked: false,
+            is_compressed: false,
+            drift_score: null,
+            round_number: 1,
+            created_at: 100,
+          },
+          {
+            id: "assistant-msg-1",
+            sender_id: "g54",
+            message_type: "assistant",
+            content: "已从持久化消息回填最终回复",
+            is_masked: false,
+            is_compressed: false,
+            drift_score: null,
+            round_number: 1,
+            created_at: 101,
+          },
+        ]);
+      }
+      if (path === "/api/sessions/workspace-session/workspace") {
+        return mockJsonResponse({
+          root_path: "D:/repo/demo",
+          display_name: "demo-repo",
+          repo_fingerprint: "fingerprint-123",
+          scan_excludes: [],
+          selected_paths: ["README.md"],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "2 个文件，1 个顶层目录/文件",
+          files: ["README.md"],
+          tree: [
+            {
+              name: "README.md",
+              path: "README.md",
+              kind: "file",
+              children: [],
+            },
+          ],
+        });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    (openSessionStream as jest.MockedFunction<typeof openSessionStream>).mockImplementation(
+      (_sessionId, callback) => {
+        streamCallback = callback;
+        return jest.fn();
+      },
+    );
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const textarea = Array.from(container.querySelectorAll("textarea")).find((node) =>
+      (node as HTMLTextAreaElement).placeholder.includes("@alias"),
+    ) as HTMLTextAreaElement | undefined;
+    expect(textarea).toBeDefined();
+
+    await act(async () => {
+      textarea!.value = "@g54 直接修复";
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    const sendButton = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("发送"),
+    ) as HTMLButtonElement | undefined;
+    expect(sendButton).toBeDefined();
+
+    await act(async () => {
+      sendButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      for (let i = 0; i < 6; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    expect(openSessionStream).toHaveBeenCalled();
+    expect(streamCallback).not.toBeNull();
+
+    await act(async () => {
+      streamCallback?.("round_end", {
+        round: 1,
+      });
+      for (let i = 0; i < 6; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    expect(messageFetchCount).toBe(2);
+    expect(container.textContent).toContain("已从持久化消息回填最终回复");
   });
 
   test("allows resizing the session chat and workspace panes", async () => {

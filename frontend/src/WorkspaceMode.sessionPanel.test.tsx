@@ -101,6 +101,51 @@ describe("WorkspaceSessionPanel file viewer", () => {
     expect(container.textContent).toContain("print('workspace file viewer')");
   });
 
+  test("shows a write-mode toggle for existing workspace sessions even without capabilities", async () => {
+    const workspace: SessionWorkspaceView = {
+      root_path: "D:/repo/demo",
+      display_name: "demo-repo",
+      repo_fingerprint: "fingerprint-123",
+      scan_excludes: [],
+      selected_paths: [],
+      index_status: "ready",
+      last_scanned_at: 1710000000,
+      summary: "2 files",
+      capabilities: null,
+      files: [],
+      tree: [],
+    };
+    const onToggleWriteMode = jest.fn().mockResolvedValue(undefined);
+
+    await act(async () => {
+      root.render(
+        <WorkspaceSessionPanel
+          sessionId="workspace-session"
+          workspace={workspace}
+          participants={[{ custom_id: "claude", model_ref: "anthropic/claude-4.6" }]}
+          capabilities={null}
+          onToggleWriteMode={onToggleWriteMode}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("修复与执行");
+    expect(container.textContent).toContain("只读");
+
+    const toggleButton = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("开启写入"),
+    ) as HTMLButtonElement | undefined;
+    expect(toggleButton).toBeDefined();
+
+    await act(async () => {
+      toggleButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(onToggleWriteMode).toHaveBeenCalledWith(true);
+  });
+
   test("allows resizing the workspace tree and file panes", async () => {
     const workspace: SessionWorkspaceView = {
       root_path: "D:/repo/demo",

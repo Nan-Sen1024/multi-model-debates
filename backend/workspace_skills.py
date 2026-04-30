@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .workspace_capabilities import WorkspaceCapabilityManifest
+from .workspace_scanner import _resolve_workspace_root
 
 
 @dataclass
@@ -108,7 +109,7 @@ def _resolve_skill_root(workspace_root: str, configured_path: str) -> Optional[P
     path = Path(normalized).expanduser()
     if path.is_absolute():
         return path
-    return Path(workspace_root).expanduser() / normalized
+    return _resolve_workspace_root(workspace_root).resolve(strict=False) / normalized
 
 
 def _load_skill(skill_file: Path, source_type: str, source_label: Optional[str]) -> Optional[WorkspaceSkill]:

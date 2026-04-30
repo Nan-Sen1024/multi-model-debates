@@ -19,11 +19,20 @@ export type CollaborationMode =
 export type StreamEventType =
   | "ping"
   | "turn_start"
+  | "phase_start"
+  | "phase_end"
   | "chunk"
+  | "reasoning_note"
+  | "model_request"
+  | "model_output"
+  | "model_response"
   | "agent_plan"
   | "tool_call"
+  | "tool_output"
   | "tool_result"
+  | "state_write"
   | "turn_end"
+  | "participant_error"
   | "round_end"
   | "drift_alert"
   | "compression"
@@ -142,21 +151,29 @@ export interface ProviderRecord {
 export interface ChatMessage {
   id: string;
   senderId: string;
-  type: "user" | "model" | "system";
+  type: "user" | "model" | "system" | "execution";
   content: string;
   round: number;
   driftScore?: number;
   status?: "streaming" | "done" | "warning" | "error";
+  executionKind?: ExecutionEventRecord["kind"];
+  executionPhase?: string;
+  executionTitle?: string;
+  executionDetail?: string;
 }
 
 export interface ExecutionEventRecord {
   id: string;
   event: Exclude<StreamEventType, "ping" | "chunk" | "compression" | "drift_alert">;
+  correlationKey?: string;
   participantId?: string;
   round: number;
   summary: string;
   detail?: string;
-  status: "running" | "done" | "error" | "info";
+  status: "running" | "done" | "error" | "warning" | "info";
+  phase?: string;
+  kind?: "phase" | "model" | "tool" | "output" | "state" | "note" | "turn" | "session";
+  metadata?: Record<string, unknown>;
 }
 
 export interface SkillSourceConfig {
@@ -205,17 +222,32 @@ export interface StreamPayload {
   content?: string;
   round?: number;
   execution_mode?: string;
+  phase?: string;
+  target?: string;
   score?: number;
   action?: string;
   masked_count?: number;
   checkpoint_id?: string;
   reason?: string;
   summary?: string;
+  input_message_count?: number;
+  target_count?: number;
+  file_count?: number;
+  step?: number;
   code?: string;
   message?: string;
+  provider_id?: string;
+  provider_name?: string;
+  auth_type?: string;
+  remediation?: string;
   server_name?: string;
   tool_name?: string;
   arguments?: Record<string, unknown>;
+  stream?: string;
+  command?: string;
+  cwd?: string;
+  exit_code?: number;
+  model_ref?: string;
   text?: string;
   ts?: number;
 }

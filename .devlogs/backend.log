@@ -1,0 +1,51 @@
+INFO:     Started server process [74603]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:34500 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/providers HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/providers HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/messages HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/snapshot HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/workspace HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/snapshot HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/messages HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/workspace HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/snapshot HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/messages HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/workspace HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/model-catalog/discover HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "POST /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/messages HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/snapshot HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/workspace HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48404 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/stream HTTP/1.1" 200 OK
+[92m22:13:53 - LiteLLM:WARNING[0m: authenticator.py:61 - ChatGPT refresh token failed, re-login required: Refresh token failed: Client error '401 Unauthorized' for url 'https://auth.openai.com/oauth/token'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401
+Provider cc failed before emitting output for g53
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/snapshot HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions/2a9efb15-b492-42f9-8711-aaa835a8f690/workspace HTTP/1.1" 200 OK
+INFO:     127.0.0.1:0 - "GET /api/sessions HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [74603]

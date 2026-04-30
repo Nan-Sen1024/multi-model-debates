@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional, Union
 
 import aiosqlite
 
@@ -16,13 +16,30 @@ from .context_compressor import ContextCompressor
 from .database import DB_PATH, init_db
 from .drift_detector import DriftDetector
 from .enums import APIFormat, AuthType, CollaborationMode, MessageType, ProviderType, SessionStatus
-from .exceptions import ValidationError
-from .llm_gateway import LLMGatewayClient, ProviderRouter, deserialize_auth_config, validate_model_ref
+from .exceptions import AuthenticationError, ValidationError
+from .llm_gateway import (
+    LLMGatewayClient,
+    ProviderRouter,
+    deserialize_auth_config,
+    serialize_auth_config,
+    validate_model_ref,
+)
 from .message_store import MessageStore
 from .models import AuthConfig, Checkpoint, CollaborationMessage, ModelParticipant, ProviderConfig, Session, SessionConfig, SessionSnapshot, WorkspaceConfig
 from .workspace_context import build_workspace_file_context, build_workspace_skill_context
-from .workspace_capabilities import workspace_capabilities_from_dict, workspace_capabilities_to_dict
-from .workspace_agent import WorkspaceAgentRunner, resolve_workspace_agent_profile
+from .workspace_capabilities import (
+    AgentProfileConfig,
+    WorkspaceCapabilityManifest,
+    workspace_capabilities_from_dict,
+    workspace_capabilities_to_dict,
+)
+from .workspace_agent import (
+    WorkspaceAgentEvent,
+    WorkspaceAgentRunResult,
+    WorkspaceAgentRunner,
+    resolve_workspace_agent_profile,
+)
+from .workspace_executor import WorkspaceExecutionRuntime
 from .workspace_mcp import WorkspaceMCPRuntime
 from .workspace_router import resolve_workspace_targets
 from .workspace_scanner import scan_workspace
@@ -31,6 +48,38 @@ from .strategies import StrategyRegistry
 
 logger = logging.getLogger(__name__)
 USER_SENDER_ID = "[用户]"
+
+
+def _participant_error_code(exc: Exception) -> str:
+    if isinstance(exc, AuthenticationError):
+        return "AUTHENTICATION_REQUIRED"
+    return "PROVIDER_UNAVAILABLE"
+
+
+def _participant_error_metadata(
+    exc: Exception,
+    participant: ModelParticipant,
+    provider_config: Optional[ProviderConfig] = None,
+) -> Dict[str, object]:
+    provider = provider_config or getattr(exc, "_mmd_provider_config", None)
+    code = _participant_error_code(exc)
+    metadata: Dict[str, object] = {
+        "code": code,
+        "message": str(exc),
+        "model_ref": participant.model_ref,
+    }
+    if provider is not None:
+        metadata.update(
+            {
+                "provider_id": provider.id,
+                "provider_name": provider.name,
+                "auth_type": provider.auth_type.value,
+            }
+        )
+    if code == "AUTHENTICATION_REQUIRED":
+        metadata["summary"] = "认证已过期或失效"
+        metadata["remediation"] = "请重新登录该 Provider，或切换到可用 fallback。"
+    return metadata
 
 
 @dataclass
@@ -119,11 +168,11 @@ class SessionOrchestrator:
 
     async def create_session(self, config: CreateSessionRequest) -> Session:
         if not config.topic or not config.topic.strip():
-            raise ValidationError("Topic 不能为空，请输入有效的话题或任务描述。", field="topic")
+            raise ValidationError("topic 不能为空", field="topic")
         if len(config.participants) < 2:
-            raise ValidationError("至少需要 2 个参与模型。", field="participants")
+            raise ValidationError("participants 至少需要 2 个参与者", field="participants")
         if len(config.participants) > 10:
-            raise ValidationError("最多支持 10 个参与模型。", field="participants")
+            raise ValidationError("participants 最多支持 10 个参与者", field="participants")
 
         inputs = self._resolve_custom_ids(config.participants)
         await self._validate_provider_bindings(inputs)
@@ -152,6 +201,7 @@ class SessionOrchestrator:
                 retention_window=config.retention_window,
                 context_threshold=config.context_threshold,
                 summary_model=config.summary_model,
+                default_model_ref=None,
                 display_title=config.topic,
                 workspace=config.workspace,
             ),
@@ -177,7 +227,7 @@ class SessionOrchestrator:
             async with db.execute("SELECT * FROM collaboration_sessions WHERE id = ?", (session_id,)) as cursor:
                 session_row = await cursor.fetchone()
             if session_row is None:
-                raise ValidationError(f"会话不存在：{session_id}", field="session_id")
+                raise ValidationError('validation error', field="session_id")
             async with db.execute(
                 "SELECT * FROM model_participants WHERE session_id = ? ORDER BY sequence_order ASC",
                 (session_id,),
@@ -212,6 +262,7 @@ class SessionOrchestrator:
                 retention_window=cfg.get("retention_window", 10),
                 context_threshold=cfg.get("context_threshold", 0.7),
                 summary_model=cfg.get("summary_model"),
+                default_model_ref=cfg.get("default_model_ref"),
                 delegate_all_tools=cfg.get("delegate_all_tools", False),
                 display_title=cfg.get("display_title"),
                 workspace=self._deserialize_workspace_config(cfg.get("workspace")),
@@ -309,6 +360,222 @@ class SessionOrchestrator:
             await self._persist_session_runtime(session)
             return session
 
+    async def update_session_default_model(
+        self,
+        session_id: str,
+        default_model_ref: Optional[str],
+    ) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            normalized = default_model_ref.strip() if isinstance(default_model_ref, str) else ""
+            if normalized:
+                validate_model_ref(normalized)
+                session.config.default_model_ref = normalized
+            else:
+                session.config.default_model_ref = None
+            await self._persist_session_runtime(session)
+            return session
+
+    async def update_workspace_can_write(
+        self,
+        session_id: str,
+        can_write: bool,
+    ) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            workspace = session.config.workspace
+            if workspace is None:
+                raise ValidationError('validation error', field="workspace")
+
+            if workspace.capabilities is None:
+                workspace.capabilities = WorkspaceCapabilityManifest(
+                    agent_defaults=AgentProfileConfig(
+                        mode="tool_loop",
+                        max_steps=6,
+                        can_write=bool(can_write),
+                    ),
+                )
+                await self._persist_session_runtime(session)
+                return session
+
+            workspace.capabilities.agent_defaults.can_write = bool(can_write)
+            for override in workspace.capabilities.participant_overrides.values():
+                if override.agent is not None:
+                    override.agent.can_write = bool(can_write)
+
+            await self._persist_session_runtime(session)
+            return session
+
+    async def append_participant(
+        self,
+        session_id: str,
+        participant: ParticipantInput,
+    ) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            if session.status != SessionStatus.ACTIVE:
+                raise ValidationError('validation error', field="session_status")
+
+            runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
+            if runtime.is_generating:
+                raise ValidationError('validation error', field="session_state")
+
+            if len(session.participants) >= 10:
+                raise ValidationError('validation error', field="participants")
+
+            existing_custom_ids = {self._custom_id_key(item.custom_id) for item in session.participants}
+            custom_id = self._resolve_appended_custom_id(
+                participant.custom_id,
+                existing_custom_ids,
+            )
+            model_ref = self._resolve_appended_model_ref(participant, field_name="model_ref")
+            resolved_input = ParticipantInput(
+                model_ref=model_ref,
+                provider_id=participant.provider_id,
+                custom_id=custom_id,
+                role_desc=participant.role_desc,
+            )
+            await self._validate_provider_bindings([resolved_input])
+
+            next_order = max((item.sequence_order for item in session.participants), default=0) + 1
+            new_participant = ModelParticipant(
+                id=str(uuid.uuid4()),
+                session_id=session.id,
+                custom_id=custom_id,
+                model_ref=model_ref,
+                provider_id=participant.provider_id,
+                sequence_order=next_order,
+                role_desc=participant.role_desc,
+            )
+
+            await init_db(self.db_path)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO model_participants
+                        (id, session_id, custom_id, display_name, model_ref, provider_id, role_desc, private_info, sequence_order, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_participant.id,
+                        new_participant.session_id,
+                        new_participant.custom_id,
+                        new_participant.display_name,
+                        new_participant.model_ref,
+                        new_participant.provider_id,
+                        new_participant.role_desc,
+                        new_participant.private_info,
+                        new_participant.sequence_order,
+                        new_participant.is_active,
+                    ),
+                )
+                await db.commit()
+
+            return await self.load_session(session_id)
+
+    async def append_participants(
+        self,
+        session_id: str,
+        participants: List[ParticipantInput],
+    ) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            self._validate_session_can_accept_participants(session_id, session, len(participants))
+            resolved_inputs = await self._resolve_appended_inputs(session, participants)
+            appended_participants = self._build_appended_participants(session, resolved_inputs)
+            await self._insert_model_participants(appended_participants)
+            return await self.load_session(session_id)
+
+    async def rename_participant(
+        self,
+        session_id: str,
+        current_custom_id: str,
+        new_custom_id: str,
+    ) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            if session.status != SessionStatus.ACTIVE:
+                raise ValidationError('validation error', field="session_status")
+
+            runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
+            if runtime.is_generating:
+                raise ValidationError('validation error', field="session_state")
+
+            participant = self._find_participant(session, current_custom_id)
+            if participant is None:
+                raise ValidationError('validation error', field="participant.custom_id")
+
+            normalized_new_custom_id = self._normalize_custom_id(
+                new_custom_id,
+                field_name="participant.custom_id",
+            )
+            if self._custom_id_key(normalized_new_custom_id) == self._custom_id_key(participant.custom_id):
+                return session
+
+            existing_custom_ids = {
+                self._custom_id_key(item.custom_id)
+                for item in session.participants
+                if item.id != participant.id
+            }
+            if self._custom_id_key(normalized_new_custom_id) in existing_custom_ids:
+                raise ValidationError('validation error', field="participant.custom_id")
+
+            old_custom_id = participant.custom_id
+            participant.custom_id = normalized_new_custom_id
+            participant.display_name = participant.display_name or normalized_new_custom_id
+            self._rename_snapshot_participant_key(session, old_custom_id, normalized_new_custom_id)
+
+            await init_db(self.db_path)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE model_participants SET custom_id = ?, display_name = ? WHERE session_id = ? AND id = ?",
+                    (
+                        participant.custom_id,
+                        participant.display_name,
+                        session_id,
+                        participant.id,
+                    ),
+                )
+                await db.commit()
+
+            await self._persist_session_runtime(session)
+            return await self.load_session(session_id)
+
+    async def remove_participant(self, session_id: str, custom_id: str) -> Session:
+        async with self._get_session_lock(session_id):
+            session = await self.load_session(session_id)
+            if session.status != SessionStatus.ACTIVE:
+                raise ValidationError('validation error', field="session_status")
+
+            runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
+            if runtime.is_generating:
+                raise ValidationError('validation error', field="session_state")
+
+            participant = self._find_participant(session, custom_id)
+            if participant is None:
+                raise ValidationError('validation error', field="participant.custom_id")
+
+            if len(session.participants) <= 1:
+                raise ValidationError('validation error', field="participants")
+
+            session.participants = [item for item in session.participants if item.id != participant.id]
+            self._remove_snapshot_participant_key(session, participant.custom_id)
+            if session.participants:
+                session.next_speaker_index = min(session.next_speaker_index, len(session.participants) - 1)
+            else:
+                session.next_speaker_index = 0
+
+            await init_db(self.db_path)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "DELETE FROM model_participants WHERE session_id = ? AND id = ?",
+                    (session_id, participant.id),
+                )
+                await db.commit()
+
+            await self._persist_session_runtime(session)
+            return await self.load_session(session_id)
+
     async def update_snapshot(
         self,
         session_id: str,
@@ -373,8 +640,23 @@ class SessionOrchestrator:
             try:
                 full_content = ""
                 renderable_messages = await self.message_store.load_renderable_messages(session_id)
+                yield self._stream_chunk(
+                    "phase_start",
+                    round_number=session.current_round,
+                    participant_id=participant.custom_id,
+                    phase="build_prompt",
+                    summary="step",
+                )
                 prompt_messages = self._build_dispatch_messages(session, participant, renderable_messages, runtime.manual_topic_reminder, strategy.build_system_prompt(participant, session))
                 runtime.manual_topic_reminder = False
+                yield self._stream_chunk(
+                    "phase_end",
+                    round_number=session.current_round,
+                    participant_id=participant.custom_id,
+                    phase="build_prompt",
+                    summary="step",
+                    input_message_count=len(prompt_messages),
+                )
                 yield StreamChunk(
                     "turn_start",
                     participant_id=participant.custom_id,
@@ -382,7 +664,31 @@ class SessionOrchestrator:
                     metadata={"execution_mode": "stream"},
                 )
                 try:
-                    async for chunk in self._iter_model_stream(participant, prompt_messages):
+                    yield self._stream_chunk(
+                        "model_request",
+                        round_number=session.current_round,
+                        participant_id=participant.custom_id,
+                        summary="发起模型请求",
+                        model_ref=participant.model_ref,
+                    )
+                    emitted_model_response = False
+                    async for chunk in self._iter_model_stream(
+                        participant,
+                        prompt_messages,
+                        round_number=session.current_round,
+                    ):
+                        if isinstance(chunk, StreamChunk):
+                            yield chunk
+                            continue
+                        if not emitted_model_response:
+                            emitted_model_response = True
+                            yield self._stream_chunk(
+                                "model_response",
+                                round_number=session.current_round,
+                                participant_id=participant.custom_id,
+                                summary="step",
+                                model_ref=participant.model_ref,
+                            )
                         full_content += chunk
                         yield StreamChunk("chunk", participant_id=participant.custom_id, content=chunk, round_number=session.current_round)
                 except Exception as exc:
@@ -390,7 +696,12 @@ class SessionOrchestrator:
                     self._advance_to_next_participant(session)
                     await self._persist_session_runtime(session)
                     await self._flush_pending_user_messages(session, runtime)
-                    yield StreamChunk("error", participant_id=participant.custom_id, round_number=session.current_round, metadata={"code": "PROVIDER_UNAVAILABLE", "message": str(exc)})
+                    yield StreamChunk(
+                        "participant_error",
+                        participant_id=participant.custom_id,
+                        round_number=session.current_round,
+                        metadata=_participant_error_metadata(exc, participant),
+                    )
                     return
 
                 message = CollaborationMessage(
@@ -406,6 +717,13 @@ class SessionOrchestrator:
                     message.drift_score = drift.score
                 strategy.on_message_received(message, session)
                 await self.message_store.store_message(message)
+                yield self._stream_chunk(
+                    "state_write",
+                    round_number=session.current_round,
+                    participant_id=participant.custom_id,
+                    target="message",
+                    summary="step",
+                )
                 if drift.is_drifted:
                     runtime.manual_topic_reminder = self._should_schedule_topic_reminder(session, messages, drift.score)
                     yield StreamChunk("drift_alert", participant_id=participant.custom_id, round_number=session.current_round, metadata={"score": drift.score})
@@ -434,7 +752,7 @@ class SessionOrchestrator:
             emitted_any = False
             async for chunk in self.dispatch_next(session_id):
                 emitted_any = True
-                if chunk.event == "turn_end":
+                if chunk.event in {"turn_end", "participant_error"}:
                     emitted_turn = True
                 yield chunk
                 if chunk.event in {"session_end", "error"}:
@@ -458,12 +776,25 @@ class SessionOrchestrator:
             if session.status != SessionStatus.ACTIVE:
                 return
             if session.config.workspace is None:
-                raise ValidationError("code_workspace 会话缺少 workspace 配置。", field="workspace")
+                raise ValidationError('validation error', field="workspace")
 
             try:
+                yield self._stream_chunk(
+                    "phase_start",
+                    round_number=session.current_round,
+                    phase="scan_workspace",
+                    summary="step",
+                )
                 workspace_scan = scan_workspace(
                     session.config.workspace.root_path,
                     session.config.workspace.scan_excludes,
+                )
+                yield self._stream_chunk(
+                    "phase_end",
+                    round_number=session.current_round,
+                    phase="scan_workspace",
+                    summary="step",
+                    file_count=len(workspace_scan.files),
                 )
             except ValidationError as exc:
                 yield StreamChunk(
@@ -483,7 +814,20 @@ class SessionOrchestrator:
                     latest_user_message = message.content
                     break
 
+            yield self._stream_chunk(
+                "phase_start",
+                round_number=session.current_round,
+                phase="resolve_targets",
+                summary="step",
+            )
             targets = resolve_workspace_targets(latest_user_message, session.participants)
+            yield self._stream_chunk(
+                "phase_end",
+                round_number=session.current_round,
+                phase="resolve_targets",
+                summary="step",
+                target_count=len(targets),
+            )
             if not targets:
                 return
 
@@ -492,12 +836,33 @@ class SessionOrchestrator:
                 mcp_runtime = self._mcp_runtime_factory(
                     session.config.workspace.capabilities if session.config.workspace else None
                 )
+                workspace_runtime = WorkspaceExecutionRuntime(
+                    workspace_root=session.config.workspace.root_path if session.config.workspace else None,
+                    manifest=session.config.workspace.capabilities if session.config.workspace else None,
+                    mcp_runtime=mcp_runtime,
+                )
                 for participant in targets:
+                    yield self._stream_chunk(
+                        "phase_start",
+                        round_number=session.current_round,
+                        participant_id=participant.custom_id,
+                        phase="build_prompt",
+                        summary="构建工作区上下文",
+                    )
                     prompt_messages = self._build_workspace_dispatch_messages(
                         session,
                         participant,
                         messages,
                         workspace_scan,
+                        await workspace_runtime.render_tool_context(participant.custom_id),
+                    )
+                    yield self._stream_chunk(
+                        "phase_end",
+                        round_number=session.current_round,
+                        participant_id=participant.custom_id,
+                        phase="build_prompt",
+                        summary="工作区上下文构建完成",
+                        input_message_count=len(prompt_messages),
                     )
                     agent_profile = resolve_workspace_agent_profile(
                         session.config.workspace.capabilities if session.config.workspace else None,
@@ -515,45 +880,152 @@ class SessionOrchestrator:
                         metadata={"execution_mode": execution_mode},
                     )
                     if agent_profile is not None and agent_profile.mode not in {"disabled", "none"}:
+                        agent_event_queue: asyncio.Queue[Optional[WorkspaceAgentEvent]] = asyncio.Queue()
+
+                        async def emit_agent_event(event: WorkspaceAgentEvent) -> None:
+                            await agent_event_queue.put(event)
+
                         try:
-                            runner = WorkspaceAgentRunner(mcp_runtime)
-                            agent_result = await runner.run(
-                                session=session,
-                                participant=participant,
-                                prompt_messages=prompt_messages,
-                                round_number=session.current_round,
-                                model_stream_factory=lambda current_prompt_messages, current_participant=participant: self._collect_model_output(
+                            runner = WorkspaceAgentRunner(workspace_runtime)
+
+                            async def collect_agent_model_output(
+                                current_prompt_messages: List[Dict[str, str]],
+                                current_participant: ModelParticipant = participant,
+                            ) -> str:
+                                output = ""
+                                sequence = 0
+                                async for model_chunk in self._iter_model_stream(
                                     current_participant,
                                     current_prompt_messages,
-                                ),
-                                persist_tool_message=self.message_store.store_message,
-                            )
+                                    round_number=session.current_round,
+                                ):
+                                    if isinstance(model_chunk, StreamChunk):
+                                        await emit_agent_event(
+                                            WorkspaceAgentEvent(
+                                                model_chunk.event,
+                                                participant_id=model_chunk.participant_id,
+                                                content=model_chunk.content,
+                                                round_number=model_chunk.round_number,
+                                                metadata=dict(model_chunk.metadata),
+                                            )
+                                        )
+                                        continue
+                                    if not model_chunk:
+                                        continue
+                                    output += model_chunk
+                                    sequence += 1
+                                    await emit_agent_event(
+                                        WorkspaceAgentEvent(
+                                            "model_output",
+                                            participant_id=current_participant.custom_id,
+                                            content=model_chunk,
+                                            round_number=session.current_round,
+                                            metadata={
+                                                "summary": "模型输出中",
+                                                "model_ref": current_participant.model_ref,
+                                                "sequence": sequence,
+                                            },
+                                        )
+                                    )
+                                return output
+
+                            async def run_agent() -> WorkspaceAgentRunResult:
+                                try:
+                                    return await runner.run(
+                                        session=session,
+                                        participant=participant,
+                                        prompt_messages=prompt_messages,
+                                        round_number=session.current_round,
+                                        model_stream_factory=collect_agent_model_output,
+                                        persist_tool_message=self.message_store.store_message,
+                                        emit_event=emit_agent_event,
+                                    )
+                                finally:
+                                    await agent_event_queue.put(None)
+
+                            agent_task = asyncio.create_task(run_agent())
+                            failed = False
+                            while True:
+                                agent_event = await agent_event_queue.get()
+                                if agent_event is None:
+                                    break
+                                if agent_event.event == "participant_error":
+                                    failed = True
+                                yield StreamChunk(
+                                    agent_event.event,
+                                    participant_id=agent_event.participant_id,
+                                    content=agent_event.content,
+                                    round_number=agent_event.round_number,
+                                    metadata=dict(agent_event.metadata),
+                                )
+                            agent_result = await agent_task
                         except Exception as exc:
                             logger.exception("工作区 agent 参与者 %s 执行失败", participant.custom_id)
                             yield StreamChunk(
-                                "error",
+                                "participant_error",
                                 participant_id=participant.custom_id,
                                 round_number=session.current_round,
                                 metadata={"code": "WORKSPACE_AGENT_ERROR", "message": str(exc)},
                             )
-                            return
+                            continue
                         for tool_message in agent_result.persisted_messages:
                             messages.append(tool_message)
-                        for chunk in agent_result.emitted_chunks:
-                            yield StreamChunk(
-                                chunk.event,
-                                participant_id=chunk.participant_id,
-                                content=chunk.content,
-                                round_number=chunk.round_number,
-                                metadata=dict(chunk.metadata),
-                            )
-                        if agent_result.terminated:
-                            return
                         full_content = agent_result.final_content
+                        if failed:
+                            if agent_result.failure_summary:
+                                failure_message = CollaborationMessage(
+                                    id=str(uuid.uuid4()),
+                                    session_id=session.id,
+                                    sender_id=participant.custom_id,
+                                    message_type=MessageType.DIALOGUE,
+                                    content=agent_result.failure_summary,
+                                    round_number=session.current_round,
+                                )
+                                await self.message_store.store_message(failure_message)
+                                yield StreamChunk(
+                                    "chunk",
+                                    participant_id=participant.custom_id,
+                                    content=failure_message.content,
+                                    round_number=session.current_round,
+                                )
+                                yield self._stream_chunk(
+                                    "state_write",
+                                    round_number=session.current_round,
+                                    participant_id=participant.custom_id,
+                                    target="message",
+                                    summary="step",
+                                )
+                                self.snapshot_manager.update(session, participant, failure_message.content)
+                                messages.append(failure_message)
+                            continue
                     else:
                         full_content = ""
                         try:
-                            async for chunk in self._iter_model_stream(participant, prompt_messages):
+                            yield self._stream_chunk(
+                                "model_request",
+                                round_number=session.current_round,
+                                participant_id=participant.custom_id,
+                                summary="发起模型请求",
+                                model_ref=participant.model_ref,
+                            )
+                            emitted_model_response = False
+                            async for chunk in self._iter_model_stream(
+                                participant,
+                                prompt_messages,
+                                round_number=session.current_round,
+                            ):
+                                if isinstance(chunk, StreamChunk):
+                                    yield chunk
+                                    continue
+                                if not emitted_model_response:
+                                    emitted_model_response = True
+                                    yield self._stream_chunk(
+                                        "model_response",
+                                        round_number=session.current_round,
+                                        participant_id=participant.custom_id,
+                                        summary="step",
+                                        model_ref=participant.model_ref,
+                                    )
                                 full_content += chunk
                                 yield StreamChunk(
                                     "chunk",
@@ -564,12 +1036,16 @@ class SessionOrchestrator:
                         except Exception as exc:
                             logger.exception("工作区参与者 %s 调用失败", participant.custom_id)
                             yield StreamChunk(
-                                "error",
+                                "participant_error",
                                 participant_id=participant.custom_id,
                                 round_number=session.current_round,
-                                metadata={"code": "PROVIDER_UNAVAILABLE", "message": str(exc)},
+                                metadata=_participant_error_metadata(exc, participant),
                             )
-                            return
+                            continue
+
+                    if not full_content.strip():
+                        yield StreamChunk("turn_end", participant_id=participant.custom_id, round_number=session.current_round)
+                        continue
 
                     message = CollaborationMessage(
                         id=str(uuid.uuid4()),
@@ -583,18 +1059,31 @@ class SessionOrchestrator:
                     if drift.score is not None:
                         message.drift_score = drift.score
                     await self.message_store.store_message(message)
+                    yield self._stream_chunk(
+                        "state_write",
+                        round_number=session.current_round,
+                        participant_id=participant.custom_id,
+                        target="message",
+                        summary="step",
+                    )
                     self.snapshot_manager.update(session, participant, message.content)
                     messages.append(message)
                     yield StreamChunk("turn_end", participant_id=participant.custom_id, round_number=session.current_round)
 
                 await self._persist_session_runtime(session)
+                yield self._stream_chunk(
+                    "state_write",
+                    round_number=session.current_round,
+                    target="session",
+                    summary="step",
+                )
                 yield StreamChunk("round_end", round_number=session.current_round)
             finally:
                 runtime.is_generating = False
 
     async def inject_user_message(self, session_id: str, content: str) -> None:
         if not content or not content.strip():
-            raise ValidationError("用户消息不能为空。", field="content")
+            raise ValidationError('validation error', field="content")
         runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
         if runtime.is_generating:
             runtime.pending_user_messages.append(content)
@@ -626,6 +1115,7 @@ class SessionOrchestrator:
                 retention_window=source.config.retention_window,
                 context_threshold=source.config.context_threshold,
                 summary_model=source.config.summary_model,
+                workspace=source.config.workspace,
             )
         )
         await self.inject_user_message(session.id, f"[历史继承]\n{exported}\n[历史继承结束]")
@@ -663,14 +1153,200 @@ class SessionOrchestrator:
     def _resolve_custom_ids(self, inputs: List[ParticipantInput]) -> List[ParticipantInput]:
         resolved, seen = [], set()
         for index, item in enumerate(inputs):
-            custom_id = item.custom_id or f"Model_{index + 1}"
-            if not (1 <= len(custom_id) <= 32):
-                raise ValidationError(f"Custom_ID '{custom_id}' 长度必须在 1 至 32 个字符之间。", field=f"participants[{index}].custom_id")
-            if custom_id in seen:
-                raise ValidationError(f"Custom_ID 重复：'{custom_id}' 已被其他参与者使用。", field=f"participants[{index}].custom_id")
-            seen.add(custom_id)
+            custom_id = self._normalize_custom_id(
+                item.custom_id or f"Model_{index + 1}",
+                field_name=f"participants[{index}].custom_id",
+            )
+            custom_id_key = self._custom_id_key(custom_id)
+            if custom_id_key in seen:
+                raise ValidationError(
+                    f"custom_id 不能重复: {custom_id}",
+                    field=f"participants[{index}].custom_id",
+                )
+            seen.add(custom_id_key)
             resolved.append(ParticipantInput(item.model_ref, item.provider_id, custom_id, item.role_desc))
         return resolved
+
+    def _validate_session_can_accept_participants(
+        self,
+        session_id: str,
+        session: Session,
+        append_count: int,
+    ) -> None:
+        if session.status != SessionStatus.ACTIVE:
+            raise ValidationError('validation error', field="session_status")
+
+        runtime = self._session_runtime.setdefault(session_id, SessionRuntimeState())
+        if runtime.is_generating:
+            raise ValidationError('validation error', field="session_state")
+
+        if append_count <= 0:
+            raise ValidationError('validation error', field="participants")
+
+        if len(session.participants) + append_count > 10:
+            raise ValidationError('validation error', field="participants")
+
+    @staticmethod
+    def _custom_id_key(custom_id: str) -> str:
+        return custom_id.strip().lower()
+
+    def _normalize_custom_id(self, custom_id: Optional[str], *, field_name: str) -> str:
+        normalized = custom_id.strip() if isinstance(custom_id, str) else ""
+        if not (1 <= len(normalized) <= 32):
+            raise ValidationError("custom_id 长度必须在 1-32 之间", field=field_name)
+        if self._custom_id_key(normalized) == "all":
+            raise ValidationError("custom_id 不能使用保留别名 all", field=field_name)
+        return normalized
+
+    async def _resolve_appended_inputs(
+        self,
+        session: Session,
+        participants: List[ParticipantInput],
+    ) -> List[ParticipantInput]:
+        existing_custom_ids = {self._custom_id_key(item.custom_id) for item in session.participants}
+        resolved: List[ParticipantInput] = []
+
+        for index, participant in enumerate(participants):
+            custom_id = self._resolve_appended_custom_id(
+                participant.custom_id,
+                existing_custom_ids,
+                field_name=f"participants[{index}].custom_id",
+            )
+            model_ref = self._resolve_appended_model_ref(
+                participant,
+                field_name=f"participants[{index}].model_ref",
+            )
+            resolved_input = ParticipantInput(
+                model_ref=model_ref,
+                provider_id=participant.provider_id,
+                custom_id=custom_id,
+                role_desc=participant.role_desc,
+            )
+            existing_custom_ids.add(self._custom_id_key(custom_id))
+            resolved.append(resolved_input)
+
+        await self._validate_provider_bindings(resolved)
+        return resolved
+
+    def _find_participant(self, session: Session, custom_id: str) -> Optional[ModelParticipant]:
+        target_key = self._custom_id_key(custom_id)
+        for participant in session.participants:
+            if self._custom_id_key(participant.custom_id) == target_key:
+                return participant
+        return None
+
+    def _rename_snapshot_participant_key(self, session: Session, old_custom_id: str, new_custom_id: str) -> None:
+        old_key = self._custom_id_key(old_custom_id)
+        renamed: Dict[str, str] = {}
+        updated = False
+        for key, value in session.snapshot.participant_summaries.items():
+            if self._custom_id_key(key) == old_key:
+                renamed[new_custom_id] = value
+                updated = True
+            else:
+                renamed[key] = value
+        if not updated:
+            renamed[new_custom_id] = session.snapshot.participant_summaries.get(old_custom_id, "")
+        session.snapshot.participant_summaries = renamed
+
+    def _remove_snapshot_participant_key(self, session: Session, custom_id: str) -> None:
+        target_key = self._custom_id_key(custom_id)
+        session.snapshot.participant_summaries = {
+            key: value
+            for key, value in session.snapshot.participant_summaries.items()
+            if self._custom_id_key(key) != target_key
+        }
+
+    def _resolve_appended_model_ref(
+        self,
+        participant: ParticipantInput,
+        field_name: str,
+    ) -> str:
+        model_ref = participant.model_ref.strip() if isinstance(participant.model_ref, str) else ""
+        if not model_ref:
+            raise ValidationError('validation error', field=field_name)
+
+        if "/" in model_ref:
+            validate_model_ref(model_ref)
+            return model_ref
+
+        if participant.provider_id:
+            return model_ref
+
+        raise ValidationError('validation error', field=field_name)
+
+    def _build_appended_participants(
+        self,
+        session: Session,
+        participants: List[ParticipantInput],
+    ) -> List[ModelParticipant]:
+        next_order = max((item.sequence_order for item in session.participants), default=0) + 1
+        resolved: List[ModelParticipant] = []
+
+        for offset, participant in enumerate(participants):
+            resolved.append(
+                ModelParticipant(
+                    id=str(uuid.uuid4()),
+                    session_id=session.id,
+                    custom_id=participant.custom_id or "",
+                    model_ref=participant.model_ref,
+                    provider_id=participant.provider_id,
+                    sequence_order=next_order + offset,
+                    role_desc=participant.role_desc,
+                )
+            )
+
+        return resolved
+
+    async def _insert_model_participants(
+        self,
+        participants: List[ModelParticipant],
+    ) -> None:
+        if not participants:
+            return
+
+        await init_db(self.db_path)
+        async with aiosqlite.connect(self.db_path) as db:
+            for participant in participants:
+                await db.execute(
+                    """
+                    INSERT INTO model_participants
+                        (id, session_id, custom_id, display_name, model_ref, provider_id, role_desc, private_info, sequence_order, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        participant.id,
+                        participant.session_id,
+                        participant.custom_id,
+                        participant.display_name,
+                        participant.model_ref,
+                        participant.provider_id,
+                        participant.role_desc,
+                        participant.private_info,
+                        participant.sequence_order,
+                        participant.is_active,
+                    ),
+                )
+            await db.commit()
+
+    def _resolve_appended_custom_id(
+        self,
+        requested_custom_id: Optional[str],
+        existing_custom_ids: set[str],
+        field_name: str = "participant.custom_id",
+    ) -> str:
+        if requested_custom_id and requested_custom_id.strip():
+            custom_id = self._normalize_custom_id(requested_custom_id, field_name=field_name)
+        else:
+            candidate_index = len(existing_custom_ids) + 1
+            custom_id = f"Model_{candidate_index}"
+            while self._custom_id_key(custom_id) in existing_custom_ids:
+                candidate_index += 1
+                custom_id = f"Model_{candidate_index}"
+
+        if self._custom_id_key(custom_id) in existing_custom_ids:
+            raise ValidationError(f"custom_id 不能重复: {custom_id}", field=field_name)
+        return custom_id
 
     def _build_session_summary_text(
         self,
@@ -680,7 +1356,7 @@ class SessionOrchestrator:
     ) -> str:
         summary_text = self.strategy_registry.get(session.mode).build_summary(session, messages, reason)
         if len(messages) < 2:
-            summary_text = f"会话因 {reason} 结束，消息不足，未生成详细摘要。"
+            summary_text = f"session ended: {reason}; insufficient messages, no detailed summary generated."
         return summary_text
 
     async def _persist_session(self, session: Session) -> None:
@@ -707,6 +1383,7 @@ class SessionOrchestrator:
             "retention_window": session.config.retention_window,
             "context_threshold": session.config.context_threshold,
             "summary_model": session.config.summary_model,
+            "default_model_ref": session.config.default_model_ref,
             "delegate_all_tools": session.config.delegate_all_tools,
             "display_title": session.config.display_title or session.topic,
             "current_round": session.current_round,
@@ -765,7 +1442,7 @@ class SessionOrchestrator:
         participant_map = {p.custom_id: p for p in session.participants}
         for message in messages:
             if message.message_type == MessageType.USER_INTERVENTION:
-                self.snapshot_manager.add_key_event(session, f"用户插入：{message.content}")
+                self.snapshot_manager.add_key_event(session, f"User injected: {message.content}")
             elif message.message_type == MessageType.DIALOGUE and message.sender_id in participant_map:
                 self.snapshot_manager.update(session, participant_map[message.sender_id], message.content)
                 strategy.on_message_received(message, session)
@@ -804,6 +1481,23 @@ class SessionOrchestrator:
         self._session_locks.setdefault(session_id, asyncio.Lock())
         return self._session_locks[session_id]
 
+    def _stream_chunk(
+        self,
+        event: str,
+        *,
+        round_number: int,
+        participant_id: Optional[str] = None,
+        content: str = "",
+        **metadata: object,
+    ) -> StreamChunk:
+        return StreamChunk(
+            event,
+            participant_id=participant_id,
+            content=content,
+            round_number=round_number,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+
     def _advance_to_next_participant(self, session: Session) -> None:
         session.next_speaker_index = 0 if not session.participants else (session.next_speaker_index + 1) % len(session.participants)
 
@@ -823,6 +1517,7 @@ class SessionOrchestrator:
         participant: ModelParticipant,
         messages: List[CollaborationMessage],
         workspace_scan,
+        tool_context: str = "",
     ) -> List[Dict[str, str]]:
         system_prompt = self.strategy_registry.get(session.mode).build_system_prompt(participant, session)
         parts = [self.anchor_injector.build_anchor(participant, session, include_topic=False)]
@@ -833,6 +1528,8 @@ class SessionOrchestrator:
         skill_context = build_workspace_skill_context(session, participant)
         if skill_context:
             parts.append(skill_context)
+        if tool_context:
+            parts.append(tool_context)
         parts.append(build_workspace_file_context(session, workspace_scan))
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": "\n\n".join(parts)}]
 
@@ -843,6 +1540,8 @@ class SessionOrchestrator:
     ) -> str:
         output = ""
         async for chunk in self._iter_model_stream(participant, prompt_messages):
+            if isinstance(chunk, StreamChunk):
+                continue
             output += chunk
         return output
 
@@ -850,7 +1549,8 @@ class SessionOrchestrator:
         self,
         participant: ModelParticipant,
         prompt_messages: List[Dict[str, str]],
-    ) -> AsyncIterator[str]:
+        round_number: int = 0,
+    ) -> AsyncIterator[Union[str, StreamChunk]]:
         provider_candidates = await self._resolve_provider_candidates(participant)
         if not provider_candidates:
             async for chunk in self.gateway.chat_stream(
@@ -862,13 +1562,14 @@ class SessionOrchestrator:
             return
 
         last_error: Optional[Exception] = None
-        for provider in provider_candidates:
+        for index, provider in enumerate(provider_candidates):
             emitted_output = False
             try:
                 async for chunk in self.gateway.chat_stream(
                     participant.model_ref,
                     prompt_messages,
                     provider_config=provider,
+                    on_auth_update=self._provider_auth_update_callback(provider),
                 ):
                     emitted_output = True
                     yield chunk
@@ -876,15 +1577,50 @@ class SessionOrchestrator:
             except Exception as exc:
                 if emitted_output:
                     raise
+                setattr(exc, "_mmd_provider_config", provider)
                 last_error = exc
                 logger.warning(
                     "Provider %s failed before emitting output for %s",
                     provider.name,
                     participant.custom_id,
                 )
+                if index < len(provider_candidates) - 1:
+                    yield StreamChunk(
+                        "participant_error",
+                        participant_id=participant.custom_id,
+                        round_number=round_number,
+                        metadata=_participant_error_metadata(exc, participant, provider),
+                    )
 
         if last_error is not None:
             raise last_error
+
+    def _provider_auth_update_callback(self, provider: ProviderConfig):
+        async def _callback(updated_auth_config: AuthConfig) -> None:
+            await self._persist_provider_auth_update(provider, updated_auth_config)
+
+        return _callback
+
+    async def _persist_provider_auth_update(
+        self,
+        provider: ProviderConfig,
+        updated_auth_config: AuthConfig,
+    ) -> None:
+        if updated_auth_config.auth_type != AuthType.OAUTH or updated_auth_config.oauth_token is None:
+            return
+
+        provider.auth_type = AuthType.OAUTH
+        provider.auth_config = updated_auth_config
+        auth_json = json.dumps(serialize_auth_config(updated_auth_config), ensure_ascii=False)
+
+        await init_db(self.db_path)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE provider_configs SET auth_type = ?, auth_config = ? WHERE id = ?",
+                (AuthType.OAUTH.value, auth_json, provider.id),
+            )
+            await db.commit()
+        logger.info("OAuth token refresh persisted for provider %s", provider.name)
 
     def _resolve_auth_config(self, participant: ModelParticipant) -> AuthConfig:
         del participant
@@ -905,17 +1641,20 @@ class SessionOrchestrator:
         existing = {row["id"] for row in rows}
         for index, participant in enumerate(participants):
             if participant.provider_id and participant.provider_id not in existing:
-                raise ValidationError(
-                    f"Provider '{participant.provider_id}' does not exist",
-                    field=f"participants[{index}].provider_id",
-                )
+                raise ValidationError('validation error', field=f"participants[{index}].provider_id")
 
     async def _resolve_provider_candidates(self, participant: ModelParticipant) -> List[ProviderConfig]:
         if participant.provider_id:
             primary = await self._load_provider_by_id(participant.provider_id)
             if primary is None:
                 return []
-            return await self._expand_provider_chain([primary], primary.fallback_ids)
+            candidates = await self._expand_provider_chain([primary], primary.fallback_ids)
+            compatible_fallbacks = await self._load_compatible_model_fallbacks(
+                primary,
+                participant.model_ref,
+                {provider.id for provider in candidates},
+            )
+            return [*candidates, *compatible_fallbacks]
 
         try:
             provider_key, _ = validate_model_ref(participant.model_ref)
@@ -957,6 +1696,37 @@ class SessionOrchestrator:
             if fallback and fallback.is_active and fallback.id not in seen:
                 resolved.append(fallback)
                 seen.add(fallback.id)
+        return resolved
+
+    async def _load_compatible_model_fallbacks(
+        self,
+        primary: ProviderConfig,
+        model_ref: str,
+        seen: set[str],
+    ) -> List[ProviderConfig]:
+        requested_model = model_ref.split("/", 1)[-1].strip()
+        if not requested_model:
+            return []
+        candidates = await self._load_providers_by_query(
+            """SELECT * FROM provider_configs
+               WHERE is_active = 1
+                 AND id != ?
+                 AND api_format = ?
+               ORDER BY name ASC""",
+            (primary.id, primary.api_format.value),
+        )
+        resolved: List[ProviderConfig] = []
+        for provider in candidates:
+            if provider.id in seen:
+                continue
+            default_ref = provider.auth_config.metadata.get("default_model_ref")
+            if default_ref is None:
+                continue
+            normalized_default = str(default_ref).split("/", 1)[-1].strip()
+            if normalized_default != requested_model:
+                continue
+            resolved.append(provider)
+            seen.add(provider.id)
         return resolved
 
     async def _load_provider_by_id(self, provider_id: str) -> Optional[ProviderConfig]:
@@ -1002,7 +1772,7 @@ class SessionOrchestrator:
 
     async def _store_user_message(self, session: Session, content: str) -> None:
         await self.message_store.store_message(CollaborationMessage(id=str(uuid.uuid4()), session_id=session.id, sender_id=USER_SENDER_ID, message_type=MessageType.USER_INTERVENTION, content=content, round_number=session.current_round))
-        self.snapshot_manager.add_key_event(session, f"用户插入：{content}")
+        self.snapshot_manager.add_key_event(session, f"User inserted: {content}")
         session.next_speaker_index = 0
 
     def _should_schedule_topic_reminder(self, session: Session, messages: List[CollaborationMessage], current_score: Optional[float]) -> bool:
@@ -1022,3 +1792,6 @@ class SessionOrchestrator:
     @staticmethod
     def _from_timestamp(timestamp: int) -> datetime:
         return datetime.fromtimestamp(timestamp, tz=timezone.utc).replace(tzinfo=None)
+
+
+

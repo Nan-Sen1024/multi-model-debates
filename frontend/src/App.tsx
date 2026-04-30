@@ -6,6 +6,7 @@ import React, {
 } from "react";
 
 import {
+  appendSessionParticipants,
   bindAwsRole,
   cancelAuthFlow,
   createProvider,
@@ -28,6 +29,7 @@ import {
   sendUserMessage,
   startAuthFlow,
   updateSession,
+  updateSessionWorkspaceCanWrite,
   updateProvider,
 } from "./api";
 import { API_FORMATS, AUTH_TYPES, MODE_OPTIONS, PROVIDER_TYPES } from "./modeOptions";
@@ -40,6 +42,7 @@ import {
   ModelRefSelect,
   formatParticipantModelSelection,
   parseParticipantModelSelection,
+  resolveParticipantModelSelection,
 } from "./modelCatalog";
 import type { ProviderModelCatalog } from "./modelCatalog";
 import {
@@ -139,6 +142,15 @@ const EMPTY_PROVIDER_DRAFT: ProviderDraft = {
   default_model_ref: "",
 };
 
+function createEmptySessionParticipantDraft(): ParticipantConfig {
+  return {
+    custom_id: "",
+    model_ref: "",
+    provider_id: undefined,
+    role_desc: "",
+  };
+}
+
 function parseAuthMetadataInput(raw: string): Record<string, unknown> {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -164,6 +176,36 @@ function parseTextareaLines(raw: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function mergeStoredMessagesIntoTranscript(
+  currentMessages: ChatMessage[],
+  storedMessages: ChatMessage[],
+): ChatMessage[] {
+  if (storedMessages.length === 0) {
+    return currentMessages;
+  }
+
+  let storedIndex = 0;
+  const merged: ChatMessage[] = [];
+
+  for (const message of currentMessages) {
+    if (message.type === "execution") {
+      merged.push(message);
+      continue;
+    }
+    if (storedIndex < storedMessages.length) {
+      merged.push(storedMessages[storedIndex]);
+      storedIndex += 1;
+    }
+  }
+
+  while (storedIndex < storedMessages.length) {
+    merged.push(storedMessages[storedIndex]);
+    storedIndex += 1;
+  }
+
+  return merged;
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -235,6 +277,8 @@ export default function App(): JSX.Element {
   const visibleMessages = streamView.liveMessage
     ? [...streamView.messages, streamView.liveMessage]
     : streamView.messages;
+  const isSessionStreaming =
+    streamView.streamState === "connecting" || streamView.streamState === "streaming";
 
   useEffect(() => {
     return () => {
@@ -268,6 +312,37 @@ export default function App(): JSX.Element {
     if (!session) return;
     saveComposerDraft(session.id, input);
   }, [session, input]);
+
+  useEffect(() => {
+    if (!session || activeTab !== 3 || session.mode !== "code_workspace" || isSessionStreaming) {
+      return;
+    }
+
+    const syncSessionState = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      void refreshSessionState(session.id, { reloadMessages: true });
+    };
+
+    const timer = window.setInterval(syncSessionState, 5000);
+    const handleFocus = () => {
+      syncSessionState();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        syncSessionState();
+      }
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [activeTab, isSessionStreaming, session]);
 
   function mapStoredMessage(message: SessionMessageRecord): ChatMessage {
     const isUserMessage =
@@ -608,12 +683,41 @@ export default function App(): JSX.Element {
     }
   }
 
-  async function refreshSessionState(sessionId: string) {
+  async function refreshSessionState(
+    sessionId: string,
+    options?: { reloadMessages?: boolean },
+  ) {
     try {
-      const [detail, snap] = await Promise.all([getSession(sessionId), getSnapshot(sessionId)]);
+      const [detail, snap, history] = await Promise.all([
+        getSession(sessionId),
+        getSnapshot(sessionId),
+        options?.reloadMessages
+          ? getSessionMessages(sessionId).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      const workspace = detail.workspace ? await getSessionWorkspace(sessionId).catch(() => null) : null;
       setSession(detail);
       setSnapshot(snap);
+      setWorkspaceView(workspace);
+      if (history) {
+        const storedMessages = history.map(mapStoredMessage);
+        setStreamView((current) => ({
+          ...current,
+          messages: mergeStoredMessagesIntoTranscript(current.messages, storedMessages),
+          liveMessage: null,
+        }));
+      }
       void reloadSessions();
+    } catch (err) {
+      push((err as Error).message, "error");
+    }
+  }
+
+  async function handleToggleWorkspaceWriteMode(sessionId: string, canWrite: boolean) {
+    try {
+      await updateSessionWorkspaceCanWrite(sessionId, canWrite);
+      await refreshSessionState(sessionId);
+      push(canWrite ? "已开启修复与执行" : "已关闭修复与执行", "success");
     } catch (err) {
       push((err as Error).message, "error");
     }
@@ -686,6 +790,33 @@ export default function App(): JSX.Element {
     }
   }
 
+  async function handleAppendParticipantToSession(
+    sessionId: string,
+    payloads: ParticipantConfig[],
+  ) {
+    try {
+      const normalizedPayloads = payloads.map((item) => ({
+        ...item,
+        ...resolveParticipantModelSelection(providerCatalogs, item),
+      }));
+      const updated = await appendSessionParticipants(sessionId, normalizedPayloads);
+      if (session?.id === sessionId) {
+        setSession(updated);
+      }
+      await reloadSessions();
+      const appendedLabels = normalizedPayloads
+        .map((item) => item.custom_id?.trim())
+        .filter((item): item is string => Boolean(item));
+      push(
+        `已添加参与者 ${updated.participants[updated.participants.length - 1]?.custom_id || ""}`,
+        "success",
+      );
+    } catch (err) {
+      push((err as Error).message, "error");
+      throw err;
+    }
+  }
+
   async function handleBindAwsRole(providerId: string) {
     const flow = authFlows[providerId];
     const sel = awsRoleSelection[providerId];
@@ -703,6 +834,10 @@ export default function App(): JSX.Element {
     e.preventDefault();
     setLoading(true);
     try {
+      const normalizedParticipants = participants.map((item) => ({
+        ...item,
+        ...resolveParticipantModelSelection(providerCatalogs, item),
+      }));
       const workspace =
         mode === "code_workspace"
           ? {
@@ -718,7 +853,7 @@ export default function App(): JSX.Element {
         throw new Error("代码工作区模式需要填写本地仓库路径。");
       }
 
-      const created = await createSession({ topic, mode, participants, workspace });
+      const created = await createSession({ topic, mode, participants: normalizedParticipants, workspace });
       const detail = await getSession(created.id);
       const [snap, workspaceData] = await Promise.all([
         getSnapshot(created.id),
@@ -818,11 +953,15 @@ export default function App(): JSX.Element {
     }
     if (eventName === "compression") { push(`上下文压缩：${payload.action || "unknown"}`, "info"); return; }
     if (eventName === "round_end") {
-      if (session) void refreshSessionState(session.id);
+      if (session) void refreshSessionState(session.id, { reloadMessages: true });
       return;
     }
     if (eventName === "session_end") {
-      if (session) void refreshSessionState(session.id);
+      if (session) void refreshSessionState(session.id, { reloadMessages: true });
+      return;
+    }
+    if (eventName === "error") {
+      if (session) void refreshSessionState(session.id, { reloadMessages: true });
       return;
     }
   }
@@ -950,10 +1089,12 @@ export default function App(): JSX.Element {
 
       {/* Tab 3 – Session Detail */}
       {activeTab === 3 && (session || sessionList.length > 0) && (
-        <TabSessionDetail
+        <SessionDetailTabEnhanced
           session={session}
           sessionList={sessionList}
           workspace={workspaceView}
+          providers={providers}
+          providerCatalogs={Object.values(providerCatalogs)}
           messages={visibleMessages}
           executionEvents={streamView.executionEvents}
           streamState={streamView.streamState}
@@ -972,6 +1113,8 @@ export default function App(): JSX.Element {
           onSelectSession={handleSelectSession}
           onRenameSession={handleRenameSession}
           onDeleteSession={handleDeleteSession}
+          onAppendParticipant={handleAppendParticipantToSession}
+          onToggleWorkspaceWriteMode={handleToggleWorkspaceWriteMode}
           onSaveSnapshot={handleSaveSnapshot}
           onExportHistory={handleExportHistory}
           onStreamEvent={handleStreamEvent}
@@ -1651,10 +1794,17 @@ function TabCreateSession({
           </div>
           <div className="participant-list">
             {participants.map((p, i) => {
-              const selectionValue = formatParticipantModelSelection(p.provider_id, p.model_ref);
+              const resolvedSelection = resolveParticipantModelSelection(providerCatalogs, {
+                provider_id: p.provider_id,
+                model_ref: p.model_ref,
+              });
+              const selectionValue = formatParticipantModelSelection(
+                resolvedSelection.provider_id,
+                resolvedSelection.model_ref,
+              );
               const modelGroups = buildParticipantModelGroups(
                 providerCatalogs,
-                p.provider_id,
+                resolvedSelection.provider_id,
                 selectionValue,
               );
 
@@ -1691,9 +1841,10 @@ function TabCreateSession({
                         groups={modelGroups}
                         onChange={(value) => {
                           const parsed = parseParticipantModelSelection(value);
+                          const resolved = resolveParticipantModelSelection(providerCatalogs, parsed);
                           onUpdateParticipant(i, {
-                            provider_id: parsed.provider_id,
-                            model_ref: parsed.model_ref,
+                            provider_id: resolved.provider_id,
+                            model_ref: resolved.model_ref,
                           });
                         }}
                       />
@@ -1724,6 +1875,8 @@ interface TabSessionDetailProps {
   session: SessionDetail | null;
   sessionList: SessionListItem[];
   workspace: SessionWorkspaceView | null;
+  providers: ProviderRecord[];
+  providerCatalogs: ProviderModelCatalog[];
   messages: ChatMessage[];
   executionEvents: ExecutionEventRecord[];
   streamState: StreamState;
@@ -1740,16 +1893,235 @@ interface TabSessionDetailProps {
   onSelectSession: (sessionId: string) => void;
   onRenameSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string) => void;
+  onAppendParticipant: (sessionId: string, payloads: ParticipantConfig[]) => Promise<void>;
+  onToggleWorkspaceWriteMode: (sessionId: string, canWrite: boolean) => Promise<void>;
   onSaveSnapshot: () => void;
   onExportHistory: () => void;
   onStreamEvent: (eventName: string, payload: StreamPayload) => void;
 }
 
+function SessionDetailTabEnhanced(props: TabSessionDetailProps) {
+  const { session, providers, providerCatalogs, streamState, onAppendParticipant } = props;
+  const [appendOpen, setAppendOpen] = useState(false);
+  const [appendDrafts, setAppendDrafts] = useState<ParticipantConfig[]>(() => [createEmptySessionParticipantDraft()]);
+  const isStreaming = streamState === "connecting" || streamState === "streaming";
+
+  useEffect(() => {
+    setAppendOpen(false);
+    setAppendDrafts([createEmptySessionParticipantDraft()]);
+  }, [session?.id]);
+
+  async function handleAppendParticipantSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!session || isStreaming || appendDrafts.some((item) => !item.model_ref.trim())) {
+      return;
+    }
+    const normalizedDrafts = appendDrafts.map((item) => ({
+      ...item,
+      ...resolveParticipantModelSelection(providerCatalogs, item),
+    }));
+    try {
+      await onAppendParticipant(session.id, normalizedDrafts);
+      setAppendDrafts([createEmptySessionParticipantDraft()]);
+      setAppendOpen(false);
+    } catch {
+      // The child callback already surfaces the error toast. Keep the form open.
+    }
+  }
+
+  function handleAppendDraftChange(index: number, patch: Partial<ParticipantConfig>) {
+    setAppendDrafts((current) =>
+      current.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, ...patch } : item,
+      ),
+    );
+  }
+
+  function handleAppendDraftAddRow() {
+    setAppendDrafts((current) => [...current, createEmptySessionParticipantDraft()]);
+  }
+
+  function handleAppendDraftRemoveRow(index: number) {
+    setAppendDrafts((current) =>
+      current.length <= 1
+        ? [createEmptySessionParticipantDraft()]
+        : current.filter((_, itemIndex) => itemIndex !== index),
+    );
+  }
+
+  return (
+    <div className="stack">
+      {session ? (
+        <div className="panel">
+          <div className="panel-head">
+            <h3>Session Participants</h3>
+            <button
+              type="button"
+              className="ghost-button small"
+              data-testid="session-participant-add-toggle"
+              onClick={() => {
+                if (isStreaming) {
+                  return;
+                }
+                setAppendOpen((current) => !current);
+              }}
+              disabled={isStreaming}
+            >
+              {appendOpen ? "Cancel" : "+ Add participant"}
+            </button>
+          </div>
+          <div className="workspace-chip-row">
+            {session.participants.map((participant) => (
+              <span key={participant.id} className="workspace-chip">@{participant.custom_id}</span>
+            ))}
+          </div>
+          <div className="status-label" style={{ marginTop: 10 }}>
+            New participants join from the next round and reuse the current session context.
+          </div>
+
+          {appendOpen ? (
+            <form className="participant-card" onSubmit={handleAppendParticipantSubmit} style={{ marginTop: 12 }}>
+              <div className="participant-card-head">
+                <strong>Add participant to this session</strong>
+                <span className="status-label">Active session only</span>
+              </div>
+              <div className="stack">
+                {appendDrafts.map((appendDraft, index) => {
+                  const resolvedSelection = resolveParticipantModelSelection(providerCatalogs, {
+                    provider_id: appendDraft.provider_id,
+                    model_ref: appendDraft.model_ref,
+                  });
+                  const appendSelectionValue = formatParticipantModelSelection(
+                    resolvedSelection.provider_id,
+                    resolvedSelection.model_ref,
+                  );
+                  const appendModelGroups = buildParticipantModelGroups(
+                    providerCatalogs,
+                    resolvedSelection.provider_id,
+                    appendSelectionValue,
+                  );
+
+                  return (
+                    <div className="participant-card" key={`append-draft-${index}`}>
+                      <div className="participant-card-head">
+                        <strong>Draft {index + 1}</strong>
+                        <button
+                          type="button"
+                          className="ghost-button small danger"
+                          data-testid="session-participant-row-remove"
+                          onClick={() => handleAppendDraftRemoveRow(index)}
+                          disabled={isStreaming}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                      <div className="form-grid-2">
+                        <label className="field">
+                          <span>Provider</span>
+                          <select
+                            data-testid="session-participant-provider"
+                            value={appendDraft.provider_id || ""}
+                            onChange={(event) =>
+                              handleAppendDraftChange(index, {
+                                provider_id: event.target.value || undefined,
+                                model_ref: "",
+                              })
+                            }
+                            disabled={isStreaming}
+                          >
+                            <option value="">Auto match by selected model</option>
+                            {providers.map((provider) => (
+                              <option key={provider.id} value={provider.id}>
+                                {provider.name} ({provider.provider_type})
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="field">
+                          <span>Model</span>
+                          <div data-testid="session-participant-model">
+                            <ModelRefSelect
+                              value={appendSelectionValue}
+                              groups={appendModelGroups}
+                              onChange={(value) => {
+                                const parsed = parseParticipantModelSelection(value);
+                                const resolved = resolveParticipantModelSelection(providerCatalogs, parsed);
+                                handleAppendDraftChange(index, {
+                                  provider_id: resolved.provider_id,
+                                  model_ref: resolved.model_ref,
+                                });
+                              }}
+                              disabled={isStreaming}
+                            />
+                          </div>
+                        </label>
+                        <label className="field">
+                          <span>Alias</span>
+                          <input
+                            data-testid="session-participant-custom-id"
+                            value={appendDraft.custom_id}
+                            onChange={(event) =>
+                              handleAppendDraftChange(index, {
+                                custom_id: event.target.value,
+                              })
+                            }
+                            placeholder="Reviewer"
+                            disabled={isStreaming}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>Role</span>
+                          <input
+                            data-testid="session-participant-role"
+                            value={appendDraft.role_desc || ""}
+                            onChange={(event) =>
+                              handleAppendDraftChange(index, {
+                                role_desc: event.target.value,
+                              })
+                            }
+                            placeholder="review code"
+                            disabled={isStreaming}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="row-actions" style={{ marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  data-testid="session-participant-row-add"
+                  onClick={handleAppendDraftAddRow}
+                  disabled={isStreaming}
+                >
+                  + Add row
+                </button>
+                <button
+                  type="submit"
+                  className="primary-button"
+                  data-testid="session-participant-submit"
+                  disabled={isStreaming || appendDrafts.some((item) => !item.model_ref.trim())}
+                >
+                  Add all to session
+                </button>
+              </div>
+            </form>
+          ) : null}
+        </div>
+      ) : null}
+
+      <TabSessionDetail {...props} />
+    </div>
+  );
+}
+
 function TabSessionDetail({
-  session, sessionList, workspace, messages, executionEvents, streamState, onSetStreamState, autoStartToken, snapshot, setSnapshot, snapshotOpen, setSnapshotOpen,
+  session, sessionList, workspace, providers, providerCatalogs, messages, executionEvents, streamState, onSetStreamState, autoStartToken, snapshot, setSnapshot, snapshotOpen, setSnapshotOpen,
   historyExport, input, setInput,
   onSendMessage, onSelectSession, onRenameSession, onDeleteSession,
-  onSaveSnapshot, onExportHistory, onStreamEvent,
+  onAppendParticipant, onToggleWorkspaceWriteMode, onSaveSnapshot, onExportHistory, onStreamEvent,
 }: TabSessionDetailProps) {
   const closeStreamRef = useRef<(() => void) | null>(null);
   const streamTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1758,8 +2130,19 @@ function TabSessionDetail({
   const sessionResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [clockTs, setClockTs] = useState(() => Date.now());
   const [rightPaneWidth, setRightPaneWidth] = useState(420);
+  const [appendOpen, setAppendOpen] = useState(false);
+  const [appendDraft, setAppendDraft] = useState<ParticipantConfig>(() => createEmptySessionParticipantDraft());
   const isStreaming = streamState === "connecting" || streamState === "streaming";
   const lastAutoStartTokenRef = useRef(0);
+  const appendSelectionValue = formatParticipantModelSelection(
+    appendDraft.provider_id,
+    appendDraft.model_ref,
+  );
+  const appendModelGroups = buildParticipantModelGroups(
+    providerCatalogs,
+    appendDraft.provider_id,
+    appendSelectionValue,
+  );
   const streamStateLabel =
     streamState === "connecting"
       ? "Connecting..."
@@ -1821,6 +2204,8 @@ function TabSessionDetail({
     closeStreamRef.current = null;
     clearStreamTimeout();
     onSetStreamState("idle");
+    setAppendOpen(false);
+    setAppendDraft(createEmptySessionParticipantDraft());
   }, [session?.id]);
 
   useEffect(() => {
@@ -1920,6 +2305,20 @@ function TabSessionDetail({
     scheduleStreamTimeout(close);
   }
 
+  async function handleAppendParticipantSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!session || isStreaming || !appendDraft.model_ref.trim()) {
+      return;
+    }
+    try {
+      await onAppendParticipant(session.id, [appendDraft]);
+      setAppendDraft(createEmptySessionParticipantDraft());
+      setAppendOpen(false);
+    } catch {
+      // The child callback already surfaces the error toast. Keep the form open.
+    }
+  }
+
   return (
     <div className="tab-content">
       <div
@@ -1996,21 +2395,47 @@ function TabSessionDetail({
               : messages.length === 0
               ? <div className="empty-state">{emptyMessage}</div>
               : messages.map((msg) => (
-                <div key={msg.id} className={`bubble bubble-${msg.type}${msg.status === "warning" ? " bubble-warning" : ""}${msg.status === "error" ? " bubble-error" : ""}`}>
-                  {msg.type !== "system" && (
-                    <div className="bubble-meta">
-                      <strong>{msg.senderId}</strong>
-                      <span>Round {msg.round}</span>
+                msg.type === "execution" ? (
+                  <div
+                    key={msg.id}
+                    className={`bubble bubble-execution${msg.status === "error" ? " bubble-error" : ""}`}
+                    data-message-type="execution"
+                    data-execution-kind={msg.executionKind || "unknown"}
+                    data-execution-phase={msg.executionPhase || ""}
+                  >
+                    <div className="execution-bubble-head">
+                      <span className={`execution-kind execution-kind-${msg.executionKind || "unknown"}`}>
+                        {msg.executionKind ? msg.executionKind.toUpperCase() : "NOTE"}
+                      </span>
+                      {msg.executionPhase ? <code className="execution-phase">{msg.executionPhase}</code> : null}
+                      <span className="workspace-path">Round {msg.round}</span>
                     </div>
-                  )}
-                  <div className="bubble-content">
-                    {msg.content}
-                    {msg.status === "streaming" && <span className="cursor-blink">▌</span>}
+                    <div className="execution-bubble-title">{msg.executionTitle || msg.content}</div>
+                    {msg.executionDetail ? (
+                      <pre className="execution-bubble-detail">{msg.executionDetail}</pre>
+                    ) : null}
                   </div>
-                  {typeof msg.driftScore === "number" && (
-                    <div className="drift-flag">⚠ 偏题告警：{msg.driftScore.toFixed(2)}</div>
-                  )}
-                </div>
+                ) : (
+                  <div
+                    key={msg.id}
+                    className={`bubble bubble-${msg.type}${msg.status === "warning" ? " bubble-warning" : ""}${msg.status === "error" ? " bubble-error" : ""}`}
+                    data-message-type={msg.type}
+                  >
+                    {msg.type !== "system" && (
+                      <div className="bubble-meta">
+                        <strong>{msg.senderId}</strong>
+                        <span>Round {msg.round}</span>
+                      </div>
+                    )}
+                    <div className="bubble-content">
+                      {msg.content}
+                      {msg.status === "streaming" && <span className="cursor-blink">▌</span>}
+                    </div>
+                    {typeof msg.driftScore === "number" && (
+                      <div className="drift-flag">⚠ 偏题告警：{msg.driftScore.toFixed(2)}</div>
+                    )}
+                  </div>
+                )
               ))
             }
           </div>
@@ -2076,6 +2501,7 @@ function TabSessionDetail({
               workspace={workspace}
               participants={session.participants}
               capabilities={session.workspace?.capabilities}
+              onToggleWriteMode={(nextCanWrite) => onToggleWorkspaceWriteMode(session.id, nextCanWrite)}
             />
           )}
 

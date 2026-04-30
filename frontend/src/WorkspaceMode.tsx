@@ -67,6 +67,7 @@ interface WorkspaceSessionPanelProps {
   workspace: SessionWorkspaceView | null;
   participants: ParticipantConfig[];
   capabilities?: WorkspaceCapabilityManifest | null;
+  onToggleWriteMode?: (canWrite: boolean) => Promise<void> | void;
 }
 
 export function createEmptyWorkspaceMCPDraft(): WorkspaceMCPDraft {
@@ -129,7 +130,7 @@ function parseEnvLines(raw: string): Record<string, string> {
 
 export function buildWorkspaceCapabilitiesFromDraft(
   draft: WorkspaceDraftState,
-): WorkspaceCapabilityManifest | undefined {
+): WorkspaceCapabilityManifest {
   const skillSources = parseTextareaLines(draft.skillSources).map((path) => ({
     path,
     source_type: "local",
@@ -185,65 +186,6 @@ export function buildWorkspaceCapabilitiesFromDraft(
     memory_scope: draft.agent.memoryScope.trim() || "workspace_shared",
   };
 
-  const hasNonDefaultAgent =
-    agentDefaults.mode !== "tool_loop" ||
-    agentDefaults.max_steps !== 6 ||
-    agentDefaults.can_write ||
-    agentDefaults.allowed_skills.length > 0 ||
-    agentDefaults.allowed_mcp_servers.length > 0 ||
-    agentDefaults.memory_scope !== "workspace_shared";
-
-  if (!skillSources.length && !mcpServers.length && !hasNonDefaultAgent) {
-    const participantOverrides = Object.fromEntries(
-      Object.entries(draft.participantOverrides)
-        .map(([participantId, config]) => {
-          const skills = parseTextareaLines(config.skills);
-          const serverNames = parseTextareaLines(config.mcpServers);
-          const hasAgent = Boolean(config.agentMode.trim());
-          const agent = hasAgent
-            ? {
-                mode: config.agentMode.trim(),
-                max_steps: Math.max(1, Number.parseInt(config.agentMaxSteps || "6", 10) || 6),
-                can_write: config.agentCanWrite,
-                allowed_skills: parseTextareaLines(config.agentAllowedSkills),
-                allowed_mcp_servers: parseTextareaLines(config.agentAllowedMcpServers),
-                memory_scope: config.agentMemoryScope.trim() || "workspace_shared",
-              }
-            : null;
-          if (!skills.length && !serverNames.length && !agent) {
-            return null;
-          }
-          return [
-            participantId,
-            {
-              skills,
-              mcp_servers: serverNames,
-              agent,
-            },
-          ] as const;
-        })
-        .filter((entry): entry is readonly [string, { skills: string[]; mcp_servers: string[]; agent: {
-          mode: string;
-          max_steps: number;
-          can_write: boolean;
-          allowed_skills: string[];
-          allowed_mcp_servers: string[];
-          memory_scope: string;
-        } | null }] => Boolean(entry)),
-    );
-
-    if (!Object.keys(participantOverrides).length) {
-      return undefined;
-    }
-
-    return {
-      skill_sources: skillSources,
-      mcp_servers: mcpServers,
-      agent_defaults: agentDefaults,
-      participant_overrides: participantOverrides,
-    };
-  }
-
   return {
     skill_sources: skillSources,
     mcp_servers: mcpServers,
@@ -296,6 +238,7 @@ export function WorkspaceCreatePanel({
   const [preview, setPreview] = React.useState<SessionWorkspaceView | null>(null);
   const [previewLoading, setPreviewLoading] = React.useState(false);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const selectedPaths = parseTextareaLines(draft.selectedPaths);
   const selectedPathSet = new Set(selectedPaths);
 
@@ -404,6 +347,10 @@ export function WorkspaceCreatePanel({
         <span className="badge">code_workspace</span>
       </div>
 
+      <p className="hint-text workspace-panel-intro">
+        快速设置只需要工作区路径、显示名、扫描排除和选中文件。默认是只读模式；如果要让 AI 修复代码并执行命令，先在这里打开写入权限。Skills、MCP、Agent 和参与者覆盖放在下面的“高级配置”里。
+      </p>
+
       <div className="workspace-create-grid">
         <label className="field">
           <span>工作区路径</span>
@@ -434,6 +381,32 @@ export function WorkspaceCreatePanel({
           />
         </label>
       </div>
+
+      <section className="workspace-capability-card workspace-write-toggle-card">
+        <div className="panel-head compact">
+          <div>
+            <h4 className="workspace-card-title">修复与执行</h4>
+            <p className="hint-text workspace-panel-intro">
+              关闭时 AI 只能读取文件。开启后才会暴露 `write_file` 和 `run_command`，适合自动修复和验证。
+            </p>
+          </div>
+          <span className="badge">{draft.agent.canWrite ? "可写" : "只读"}</span>
+        </div>
+        <label className="field checkbox-field">
+          <span>允许 AI 修改文件并运行命令</span>
+          <input
+            type="checkbox"
+            name="workspace-agent-can-write"
+            checked={draft.agent.canWrite}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                agent: { ...current.agent, canWrite: event.target.checked },
+              }))
+            }
+          />
+        </label>
+      </section>
 
       <section className="workspace-capability-card workspace-preview-card">
         <div className="panel-head compact">
@@ -505,8 +478,27 @@ export function WorkspaceCreatePanel({
         </label>
       </section>
 
-      <div className="workspace-capability-stack">
-        <section className="workspace-capability-card">
+      <section className="workspace-capability-card workspace-advanced-card">
+        <div className="panel-head compact">
+          <div>
+            <h4 className="workspace-card-title">高级配置</h4>
+            <p className="hint-text workspace-panel-intro">
+              Skills、MCP、默认 Agent 和参与者覆盖都放在这里。常见场景只有需要自定义时再展开。
+            </p>
+          </div>
+          <button
+            type="button"
+            className="ghost-button small"
+            aria-expanded={advancedOpen}
+            aria-controls="workspace-advanced-config"
+            onClick={() => setAdvancedOpen((current) => !current)}
+          >
+            {advancedOpen ? "收起高级配置" : "展开高级配置"}
+          </button>
+        </div>
+        {advancedOpen ? (
+          <div id="workspace-advanced-config" className="workspace-capability-stack">
+            <section className="workspace-capability-card">
           <div className="panel-head compact">
             <h4 className="workspace-card-title">Skills</h4>
             <span className="badge">{parseTextareaLines(draft.skillSources).length} 个来源</span>
@@ -688,20 +680,10 @@ export function WorkspaceCreatePanel({
               />
             </label>
 
-            <label className="field checkbox-field">
-              <span>允许写入工作区</span>
-              <input
-                type="checkbox"
-                name="workspace-agent-can-write"
-                checked={draft.agent.canWrite}
-                onChange={(event) =>
-                  onChange((current) => ({
-                    ...current,
-                    agent: { ...current.agent, canWrite: event.target.checked },
-                  }))
-                }
-              />
-            </label>
+            <div className="field">
+              <span>代理模式可写入</span>
+              <span className="muted-text">写入权限在上面的“修复与执行”里控制</span>
+            </div>
 
             <label className="field">
               <span>允许技能（每行一个）</span>
@@ -849,7 +831,11 @@ export function WorkspaceCreatePanel({
             }) : <div className="muted-text">先添加参与者，才能配置单独覆盖。</div>}
           </div>
         </section>
-      </div>
+          </div>
+        ) : (
+          <div className="muted-text">高级配置已折叠，只有需要 Skills、MCP、Agent 或参与者覆盖时再展开。</div>
+        )}
+      </section>
 
       <div className="workspace-hint">
         <div className="muted-text">本地代码工作区会把仓库树、选中文件和模型别名一起送入上下文。</div>
@@ -930,11 +916,14 @@ export function WorkspaceSessionPanel({
   workspace,
   participants,
   capabilities,
+  onToggleWriteMode,
 }: WorkspaceSessionPanelProps): JSX.Element {
   const [activeFilePath, setActiveFilePath] = React.useState<string | null>(null);
   const [fileView, setFileView] = React.useState<WorkspaceFileContentRecord | null>(null);
   const [fileError, setFileError] = React.useState<string | null>(null);
   const [fileLoadingPath, setFileLoadingPath] = React.useState<string | null>(null);
+  const [writeModeLoading, setWriteModeLoading] = React.useState(false);
+  const [writeModeError, setWriteModeError] = React.useState<string | null>(null);
   const [expandedDirs, setExpandedDirs] = React.useState<Record<string, boolean>>({});
   const [treePaneWidth, setTreePaneWidth] = React.useState(280);
   const browserResizeRef = React.useRef<{ startX: number; startWidth: number } | null>(null);
@@ -976,6 +965,23 @@ export function WorkspaceSessionPanel({
   }
 
   const capabilityManifest = capabilities || workspace.capabilities || null;
+  const workspaceCanWrite = Boolean(capabilityManifest?.agent_defaults.can_write);
+  const showWriteModeCard = Boolean(capabilityManifest) || Boolean(onToggleWriteMode);
+
+  const handleToggleWriteMode = async () => {
+    if (!onToggleWriteMode) {
+      return;
+    }
+    setWriteModeError(null);
+    setWriteModeLoading(true);
+    try {
+      await onToggleWriteMode(!workspaceCanWrite);
+    } catch (error) {
+      setWriteModeError((error as Error).message);
+    } finally {
+      setWriteModeLoading(false);
+    }
+  };
 
   const toggleDirectory = (path: string) => {
     setExpandedDirs((current) => ({
@@ -1030,6 +1036,29 @@ export function WorkspaceSessionPanel({
           ))}
         </div>
       </div>
+
+      {showWriteModeCard ? (
+        <div className="workspace-card">
+          <div className="panel-head compact">
+            <h4 className="workspace-card-title">修复与执行</h4>
+            <div className="row-actions">
+              <span className="badge">{workspaceCanWrite ? "可写" : "只读"}</span>
+              <button
+                type="button"
+                className="ghost-button small"
+                disabled={!onToggleWriteMode || writeModeLoading}
+                onClick={handleToggleWriteMode}
+              >
+                {workspaceCanWrite ? "关闭写入" : "开启写入"}
+              </button>
+            </div>
+          </div>
+          <p className="hint-text">
+            开启后，当前会话会把本地 workspace 工具暴露为 `write_file` 和 `run_command`，适合修复代码和验证结果。
+          </p>
+          {writeModeError ? <div className="workspace-preview-error">{writeModeError}</div> : null}
+        </div>
+      ) : null}
 
       {capabilityManifest && (
         <>

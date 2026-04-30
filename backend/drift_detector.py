@@ -17,16 +17,35 @@ except ImportError:  # pragma: no cover - optional dependency
     np = None  # type: ignore
     _NUMPY_AVAILABLE = False
 
-try:
-    from sentence_transformers import SentenceTransformer
+_SENTENCE_TRANSFORMER_CLASS = None
+_ST_AVAILABLE: Optional[bool] = None
 
+
+def _get_sentence_transformer_class():
+    """Load sentence-transformers lazily so API startup stays fast."""
+    global _SENTENCE_TRANSFORMER_CLASS, _ST_AVAILABLE
+    if _SENTENCE_TRANSFORMER_CLASS is not None:
+        return _SENTENCE_TRANSFORMER_CLASS
+    if _ST_AVAILABLE is False:
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:  # pragma: no cover - optional dependency
+        _ST_AVAILABLE = False
+        logger.warning(
+            "sentence-transformers is not installed; drift detection will stay in degraded mode"
+        )
+        return None
+    except Exception as exc:  # pragma: no cover - optional dependency import failure
+        _ST_AVAILABLE = False
+        logger.warning(
+            "sentence-transformers import failed; drift detection will stay in degraded mode: %s",
+            exc,
+        )
+        return None
+    _SENTENCE_TRANSFORMER_CLASS = SentenceTransformer
     _ST_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency
-    SentenceTransformer = None  # type: ignore
-    _ST_AVAILABLE = False
-    logger.warning(
-        "sentence-transformers is not installed; drift detection will stay in degraded mode"
-    )
+    return SentenceTransformer
 
 
 @dataclass
@@ -59,11 +78,15 @@ class DriftDetector:
             return False
 
         self._load_attempted = True
-        if not (_ST_AVAILABLE and _NUMPY_AVAILABLE):
+        if not _NUMPY_AVAILABLE:
+            return False
+
+        sentence_transformer_class = _get_sentence_transformer_class()
+        if sentence_transformer_class is None:
             return False
 
         try:
-            self._model = SentenceTransformer(self._model_name)
+            self._model = sentence_transformer_class(self._model_name)
             self._available = True
         except Exception as exc:
             logger.warning(

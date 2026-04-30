@@ -18,6 +18,8 @@ export interface ModelRefGroup {
   options: ModelRefOption[];
 }
 
+type ProviderCatalogCollection = ProviderModelCatalog[] | Record<string, ProviderModelCatalog>;
+
 function normalizeModelRef(modelRef: string): string {
   return modelRef.trim();
 }
@@ -68,6 +70,61 @@ export function parseParticipantModelSelection(value: string): {
   };
 }
 
+export function resolveParticipantModelSelection(
+  catalogs: ProviderCatalogCollection,
+  selection: {
+    provider_id?: string | null;
+    model_ref: string;
+  },
+): {
+  provider_id?: string;
+  model_ref: string;
+} {
+  const normalizedModel = normalizeModelRef(selection.model_ref);
+  const explicitProvider = selection.provider_id?.trim();
+  if (!normalizedModel) {
+    return {
+      provider_id: explicitProvider || undefined,
+      model_ref: "",
+    };
+  }
+  if (explicitProvider) {
+    return {
+      provider_id: explicitProvider,
+      model_ref: normalizedModel,
+    };
+  }
+
+  const normalizedCatalogs = normalizeProviderCatalogs(catalogs);
+  const matchingProviderIds = normalizedCatalogs
+    .filter((catalog) =>
+      dedupeModels(catalog.models).some((model) => model === normalizedModel),
+    )
+    .map((catalog) => catalog.provider_id.trim())
+    .filter(Boolean);
+
+  if (matchingProviderIds.length === 1) {
+    return {
+      provider_id: matchingProviderIds[0],
+      model_ref: normalizedModel,
+    };
+  }
+
+  if (normalizedCatalogs.length === 1) {
+    const fallbackProvider = normalizedCatalogs[0].provider_id.trim();
+    if (fallbackProvider) {
+      return {
+        provider_id: fallbackProvider,
+        model_ref: normalizedModel,
+      };
+    }
+  }
+
+  return {
+    model_ref: normalizedModel,
+  };
+}
+
 function appendCurrentValueGroup(
   groups: ModelRefGroup[],
   selectedValue: string,
@@ -110,14 +167,15 @@ export function buildDraftModelGroups(
 }
 
 export function buildParticipantModelGroups(
-  catalogs: ProviderModelCatalog[],
+  catalogs: ProviderCatalogCollection,
   selectedProviderId?: string | null,
   selectedValue = "",
 ): ModelRefGroup[] {
+  const normalizedCatalogs = normalizeProviderCatalogs(catalogs);
   const groups: ModelRefGroup[] = [];
   const normalizedSelectedProviderId = selectedProviderId?.trim() || "";
 
-  for (const catalog of catalogs) {
+  for (const catalog of normalizedCatalogs) {
     const providerId = catalog.provider_id.trim();
     if (normalizedSelectedProviderId && providerId !== normalizedSelectedProviderId) {
       continue;
@@ -138,6 +196,13 @@ export function buildParticipantModelGroups(
   }
 
   return appendCurrentValueGroup(groups, selectedValue);
+}
+
+function normalizeProviderCatalogs(catalogs: ProviderCatalogCollection): ProviderModelCatalog[] {
+  if (Array.isArray(catalogs)) {
+    return catalogs;
+  }
+  return Object.values(catalogs);
 }
 
 export function getDefaultModelRefForProvider(

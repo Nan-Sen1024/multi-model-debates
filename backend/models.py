@@ -87,6 +87,7 @@ class SessionConfig:
     retention_window: int = 10
     context_threshold: float = 0.7
     summary_model: Optional[str] = None
+    default_model_ref: Optional[str] = None
     delegate_all_tools: bool = False
     display_title: Optional[str] = None
     workspace: Optional[WorkspaceConfig] = None
