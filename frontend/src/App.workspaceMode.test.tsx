@@ -50,7 +50,7 @@ describe("App code workspace mode", () => {
     container.remove();
   });
 
-  test("shows code workspace creation controls and alias hints", async () => {
+  test("shows primary task templates and downranks raw modes behind labs", async () => {
     jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const path = String(input);
       if (path === "/api/providers") {
@@ -91,33 +91,36 @@ describe("App code workspace mode", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    expect(container.textContent).toContain("多模型研发工作台");
+    expect(container.textContent).toContain("配置 Provider");
+    expect(container.textContent).toContain("新建任务");
+    expect(container.textContent).toContain("运行任务");
+
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
-    expect(createSessionTab).toBeDefined();
+    expect(createTaskTab).toBeDefined();
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    const workspaceCard = Array.from(container.querySelectorAll(".mode-card")).find((node) =>
-      node.textContent?.includes("代码工作区"),
-    ) as HTMLButtonElement | undefined;
-    expect(workspaceCard).toBeDefined();
-
-    await act(async () => {
-      workspaceCard?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await Promise.resolve();
-    });
-
+    expect(container.textContent).toContain("Analyze Repo");
+    expect(container.textContent).toContain("Fix or Implement");
+    expect(container.textContent).toContain("Review Changes");
+    expect(container.textContent).toContain("Compare Approaches");
+    expect(container.textContent).toContain("实验模式");
+    expect(container.textContent).toContain("任务目标");
     expect(container.textContent).toContain("工作区路径");
-    expect(container.textContent).toContain("@alias");
+    expect(container.textContent).toContain("别名提示");
     expect(container.textContent).toContain("本地代码工作区");
+    expect(container.textContent).not.toContain("狼人杀");
+    expect(container.textContent).not.toContain("剧本杀");
   });
 
-  test("renders workspace tree and auto-starts streaming after send", async () => {
+  test("renders run detail framing and auto-starts streaming after send", async () => {
     localStorage.setItem("mmdebate.lastSessionId", "workspace-session");
 
     jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -230,6 +233,14 @@ describe("App code workspace mode", () => {
       await Promise.resolve();
     });
 
+    expect(container.textContent).toContain("运行详情");
+    expect(container.textContent).toContain("任务侧栏");
+    expect(container.textContent).toContain("任务目标");
+    expect(container.textContent).toContain("当前运行");
+    expect(container.textContent).toContain("工作区上下文");
+    expect(container.textContent).toContain("运行记录");
+    expect(container.textContent).toContain("继续执行");
+
     expect(container.textContent).toContain("demo-repo");
     expect(container.textContent).toContain("README.md");
     expect(container.textContent).toContain("src/app.py");
@@ -239,17 +250,94 @@ describe("App code workspace mode", () => {
       (node as HTMLTextAreaElement).placeholder.includes("@alias"),
     ) as HTMLTextAreaElement | undefined;
     expect(textarea).toBeDefined();
-
-    await act(async () => {
-      textarea!.value = "@claude 先审查 README";
-      Simulate.change(textarea!);
-      await Promise.resolve();
-    });
-
     const sendButton = Array.from(container.querySelectorAll("button")).find((node) =>
       node.textContent?.includes("发送"),
     ) as HTMLButtonElement | undefined;
     expect(sendButton).toBeDefined();
+
+    await act(async () => {
+      textarea!.value = "你好啊";
+      textarea!.setSelectionRange(textarea!.value.length, textarea!.value.length);
+      Simulate.change(textarea!);
+      sendButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      for (let i = 0; i < 6; i += 1) {
+        await Promise.resolve();
+      }
+    });
+
+    expect(openSessionStream).not.toHaveBeenCalled();
+
+    await act(async () => {
+      textarea!.value = "@co";
+      textarea!.setSelectionRange(3, 3);
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    const mentionPicker = container.querySelector(".mention-picker") as HTMLElement | null;
+    expect(mentionPicker).not.toBeNull();
+    expect(mentionPicker?.textContent).toContain("@codex");
+    expect(mentionPicker?.textContent).not.toContain("@claude");
+
+    await act(async () => {
+      Simulate.keyDown(textarea!, { key: "Enter" });
+      await Promise.resolve();
+    });
+
+    expect(textarea?.value).toBe("@codex ");
+
+    await act(async () => {
+      textarea!.value = "＠cl";
+      textarea!.setSelectionRange(3, 3);
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".mention-picker")?.textContent).toContain("@claude");
+
+    await act(async () => {
+      textarea!.value = "让@co";
+      textarea!.setSelectionRange(4, 4);
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".mention-picker")?.textContent).toContain("@codex");
+
+    await act(async () => {
+      document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".mention-picker")).toBeNull();
+
+    await act(async () => {
+      textarea!.value = "@claude 先审查 README";
+      textarea!.setSelectionRange(textarea!.value.length, textarea!.value.length);
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".mention-picker")).toBeNull();
+
+    await act(async () => {
+      textarea!.value = "@claude";
+      textarea!.setSelectionRange(textarea!.value.length, textarea!.value.length);
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".mention-picker")).not.toBeNull();
+
+    await act(async () => {
+      textarea!.value = "@claude 先审查 README";
+      textarea!.setSelectionRange(textarea!.value.length, textarea!.value.length);
+      Simulate.change(textarea!);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".mention-picker")).toBeNull();
+
     expect(sendButton?.disabled).toBe(false);
 
     await act(async () => {
@@ -308,10 +396,285 @@ describe("App code workspace mode", () => {
     expect(container.textContent).toContain("实时执行日志");
     expect(container.textContent).toContain("claude 执行完成");
     expect(container.textContent).toContain("扫描工作区");
-    expect(container.textContent).toContain("filesystem.read_file");
+    expect(container.textContent).toContain("已读取文件");
     expect(container.textContent).toContain("README 内容");
+    expect(container.textContent).toContain("涉及文件");
+    expect(container.textContent).toContain("README.md");
+    expect(container.textContent).toContain("执行命令");
+    expect(container.textContent).toContain("验证状态");
     expect(container.querySelector('[data-execution-kind="phase"]')).not.toBeNull();
     expect(container.querySelectorAll('[data-execution-kind="turn"]')).toHaveLength(1);
+  });
+
+  test("summarizes run artifacts, commands, validation state, and blockers in the task sidebar", async () => {
+    localStorage.setItem("mmdebate.lastSessionId", "workspace-session");
+
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([
+          {
+            id: "workspace-session",
+            title: "workspace",
+            topic: "修复测试失败",
+            mode: "code_workspace",
+            status: "active",
+            current_round: 2,
+            updated_at: 300,
+            participant_count: 2,
+            last_message_preview: "assistant reply",
+          },
+        ]);
+      }
+      if (path === "/api/sessions/workspace-session") {
+        return mockJsonResponse({
+          id: "workspace-session",
+          title: "workspace",
+          topic: "修复测试失败",
+          mode: "code_workspace",
+          status: "active",
+          current_round: 2,
+          participants: [
+            { id: "p1", custom_id: "claude", model_ref: "anthropic/claude-4.6", is_active: true },
+            { id: "p2", custom_id: "codex", model_ref: "openai/gpt-5.4", is_active: true },
+          ],
+          workspace: {
+            root_path: "D:/repo/demo",
+            display_name: "demo-repo",
+            repo_fingerprint: "fingerprint-123",
+            scan_excludes: [],
+            selected_paths: ["README.md", "frontend/src/App.tsx"],
+            index_status: "ready",
+            last_scanned_at: 1710000000,
+            summary: "2 个文件，1 个顶层目录/文件",
+          },
+        });
+      }
+      if (path === "/api/sessions/workspace-session/snapshot") {
+        return mockJsonResponse({
+          topic: "修复测试失败",
+          mode: "code_workspace",
+          participant_summaries: {},
+          consensus_list: [],
+          key_events: [],
+        });
+      }
+      if (path === "/api/sessions/workspace-session/messages") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions/workspace-session/workspace") {
+        return mockJsonResponse({
+          root_path: "D:/repo/demo",
+          display_name: "demo-repo",
+          repo_fingerprint: "fingerprint-123",
+          scan_excludes: [],
+          selected_paths: ["README.md", "frontend/src/App.tsx"],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "2 个文件，1 个顶层目录/文件",
+          files: ["README.md", "frontend/src/App.tsx"],
+          tree: [],
+        });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    (openSessionStream as jest.MockedFunction<typeof openSessionStream>).mockImplementation(
+      (_sessionId, callback) => {
+        streamCallback = callback;
+        return jest.fn();
+      },
+    );
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const startButton = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("继续执行"),
+    ) as HTMLButtonElement | undefined;
+    expect(startButton).toBeDefined();
+
+    await act(async () => {
+      startButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      streamCallback?.("tool_call", {
+        participant_id: "claude",
+        round: 2,
+        server_name: "filesystem",
+        tool_name: "read_file",
+        arguments: { path: "README.md" },
+      });
+      streamCallback?.("tool_result", {
+        participant_id: "claude",
+        round: 2,
+        server_name: "filesystem",
+        tool_name: "read_file",
+        text: "README 内容",
+      });
+      streamCallback?.("tool_call", {
+        participant_id: "claude",
+        round: 2,
+        server_name: "workspace",
+        tool_name: "run_command",
+        arguments: { command: "npm test -- --runInBand", cwd: "D:/repo/demo" },
+      });
+      streamCallback?.("tool_result", {
+        participant_id: "claude",
+        round: 2,
+        server_name: "workspace",
+        tool_name: "run_command",
+        text: "command=npm test -- --runInBand\ncwd=D:/repo/demo\nexit_code=1",
+      });
+      streamCallback?.("participant_error", {
+        participant_id: "claude",
+        round: 2,
+        code: "TEST_FAILURE",
+        message: "1 failing test remains",
+        summary: "验证未通过",
+      });
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("涉及文件");
+    expect(container.textContent).toContain("README.md");
+    expect(container.textContent).toContain("执行命令");
+    expect(container.textContent).toContain("npm test -- --runInBand");
+    expect(container.textContent).toContain("验证状态");
+    expect(container.textContent).toContain("验证未通过");
+    expect(container.textContent).toContain("阻塞与告警");
+    expect(container.textContent).toContain("1 failing test remains");
+  });
+
+  test("keeps long commands out of the task sidebar summary while preserving them in execution surfaces", async () => {
+    localStorage.setItem("mmdebate.lastSessionId", "workspace-session");
+
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([
+          {
+            id: "workspace-session",
+            title: "workspace",
+            topic: "修复测试失败",
+            mode: "code_workspace",
+            status: "active",
+            current_round: 10,
+            updated_at: 300,
+            participant_count: 1,
+            last_message_preview: "assistant reply",
+          },
+        ]);
+      }
+      if (path === "/api/sessions/workspace-session") {
+        return mockJsonResponse({
+          id: "workspace-session",
+          title: "workspace",
+          topic: "修复测试失败",
+          mode: "code_workspace",
+          status: "active",
+          current_round: 10,
+          participants: [
+            { id: "p1", custom_id: "deepseek", model_ref: "deepseek/deepseek-chat", is_active: true },
+          ],
+          workspace: {
+            root_path: "D:/repo/demo",
+            display_name: "demo-repo",
+            repo_fingerprint: "fingerprint-123",
+            scan_excludes: [],
+            selected_paths: ["frontend/src/App.tsx"],
+            index_status: "ready",
+            last_scanned_at: 1710000000,
+            summary: "1 个文件",
+          },
+        });
+      }
+      if (path === "/api/sessions/workspace-session/snapshot") {
+        return mockJsonResponse({
+          topic: "修复测试失败",
+          mode: "code_workspace",
+          participant_summaries: {},
+          consensus_list: [],
+          key_events: [],
+        });
+      }
+      if (path === "/api/sessions/workspace-session/messages") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions/workspace-session/workspace") {
+        return mockJsonResponse({
+          root_path: "D:/repo/demo",
+          display_name: "demo-repo",
+          repo_fingerprint: "fingerprint-123",
+          scan_excludes: [],
+          selected_paths: ["frontend/src/App.tsx"],
+          index_status: "ready",
+          last_scanned_at: 1710000000,
+          summary: "1 个文件",
+          files: ["frontend/src/App.tsx"],
+          tree: [],
+        });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    (openSessionStream as jest.MockedFunction<typeof openSessionStream>).mockImplementation(
+      (_sessionId, callback) => {
+        streamCallback = callback;
+        return jest.fn();
+      },
+    );
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const startButton = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("继续执行"),
+    ) as HTMLButtonElement | undefined;
+    expect(startButton).toBeDefined();
+
+    await act(async () => {
+      startButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      streamCallback?.("tool_call", {
+        participant_id: "deepseek",
+        round: 10,
+        server_name: "workspace",
+        tool_name: "run_command",
+        arguments: {
+          command:
+            "bash -lc grep -n \"workspacePresets\\|applyWorkspaceTeamPreset\\|WorkspaceTaskPresetRecommendation\\|onApplyTaskPreset\\|onApplyTeamPreset\\|selectedTemplateId\\|PRIMARY_TASK_TEMPLATES\" frontend/src/App.tsx frontend/src/WorkspaceMode.tsx frontend/src/modeOptions.ts || true",
+          cwd: "D:/repo/demo",
+        },
+      });
+      await Promise.resolve();
+    });
+
+    const taskSidebar = container.querySelector(".task-sidebar-summary") as HTMLElement | null;
+
+    expect(taskSidebar).not.toBeNull();
+    expect(taskSidebar?.textContent).not.toContain("bash -lc grep -n");
+    expect(taskSidebar?.querySelector(".task-sidebar-command-item")).toBeNull();
+    expect(container.textContent).toContain("bash -lc grep -n");
   });
 
   test("hydrates persisted assistant replies after round end when SSE emits no chunk", async () => {
@@ -591,6 +954,7 @@ describe("App code workspace mode", () => {
 
   test("scans workspace preview and submits selected tree paths", async () => {
     let createSessionBody: Record<string, unknown> | null = null;
+    let previewRequestBody: Record<string, unknown> | null = null;
 
     jest.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
@@ -601,6 +965,7 @@ describe("App code workspace mode", () => {
         return mockJsonResponse([]);
       }
       if (path === "/api/workspace/preview" && init?.method === "POST") {
+        previewRequestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
         return mockJsonResponse({
           root_path: "D:/repo/demo",
           display_name: "demo-repo",
@@ -610,6 +975,37 @@ describe("App code workspace mode", () => {
           index_status: "ready",
           last_scanned_at: 1710000000,
           summary: "3 个文件，2 个顶层目录/文件",
+          capabilities: {
+            skill_sources: [
+              {
+                path: "D:/repo/skills",
+                source_type: "local",
+                label: null,
+                recursive: true,
+                enabled: true,
+              },
+            ],
+            mcp_servers: [],
+            agent_defaults: {
+              mode: "tool_loop",
+              max_steps: 6,
+              can_write: false,
+              allowed_skills: [],
+              allowed_mcp_servers: [],
+              memory_scope: "workspace_shared",
+            },
+            participant_overrides: {},
+          },
+          discovered_skills: [
+            {
+              name: "product-owner",
+              description: "产品化评审技能",
+              summary: "把问题收敛到 Workspace、Task、Run、Review、Provider。",
+              path: "D:/repo/skills/product-owner/SKILL.md",
+              source_type: "local",
+              source_label: null,
+            },
+          ],
           files: ["README.md", "backend/api.py", "backend/orchestrator.py"],
           tree: [
             {
@@ -704,12 +1100,12 @@ describe("App code workspace mode", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 
@@ -722,14 +1118,29 @@ describe("App code workspace mode", () => {
       await Promise.resolve();
     });
 
-    const rootPathInput = container.querySelector(
-      'input[placeholder*="multi-model-debates"]',
+    const advancedToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("高级配置"),
+    ) as HTMLButtonElement | undefined;
+    expect(advancedToggle).toBeDefined();
+
+    await act(async () => {
+      advancedToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const rootPathInput = Array.from(container.querySelectorAll("input")).find((node) =>
+      (node as HTMLInputElement).placeholder.includes("multi-model-debates"),
     ) as HTMLInputElement | null;
+    const skillSourcesInput = container.querySelector(
+      'textarea[name="workspace-skill-sources"]',
+    ) as HTMLTextAreaElement | null;
     expect(rootPathInput).not.toBeNull();
+    expect(skillSourcesInput).not.toBeNull();
 
     await act(async () => {
       rootPathInput!.value = "D:/repo/demo";
       Simulate.change(rootPathInput!);
+      Simulate.change(skillSourcesInput!, { target: { value: "D:/repo/skills" } });
       await Promise.resolve();
     });
 
@@ -744,7 +1155,54 @@ describe("App code workspace mode", () => {
       await Promise.resolve();
     });
 
+    expect(previewRequestBody).toMatchObject({
+      root_path: "D:/repo/demo",
+      scan_excludes: [],
+      capabilities: {
+        skill_sources: [
+          {
+            path: "D:/repo/skills",
+            source_type: "local",
+            recursive: true,
+            enabled: true,
+          },
+        ],
+      },
+    });
+    expect(container.textContent).toContain("Agency Starter Pack");
+    expect(container.textContent).toContain("已发现技能");
+    expect(container.textContent).toContain("product-owner");
+    expect(container.textContent).toContain("产品化评审技能");
+    expect(container.textContent).toContain("建议 Task Presets");
+    expect(container.textContent).toContain("Analyze Repo with Product Lens");
+    expect(container.textContent).toContain("建议 Team Presets");
+    expect(container.textContent).toContain("PO + Implementer");
     expect(container.textContent).toContain("backend/api.py");
+
+    const taskPresetButton = container.querySelector(
+      'button[data-workspace-task-preset="analyze_repo_product_lens"]',
+    ) as HTMLButtonElement | null;
+    const teamPresetButton = container.querySelector(
+      'button[data-workspace-team-preset="product_owner_implementer_pair"]',
+    ) as HTMLButtonElement | null;
+    const topicInput = container.querySelector(".panel textarea") as HTMLTextAreaElement | null;
+    const firstAliasInput = Array.from(container.querySelectorAll("input")).find((node) =>
+      (node as HTMLInputElement).placeholder === "Model_A",
+    ) as HTMLInputElement | undefined;
+
+    expect(taskPresetButton).not.toBeNull();
+    expect(teamPresetButton).not.toBeNull();
+    expect(topicInput).not.toBeNull();
+    expect(firstAliasInput).toBeDefined();
+
+    await act(async () => {
+      taskPresetButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      teamPresetButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(topicInput?.value).toContain("产品定位");
+    expect(firstAliasInput?.value).toBe("Product_Owner");
 
     const backendCheckbox = container.querySelector(
       'input[data-workspace-select-path="backend"]',
@@ -758,7 +1216,7 @@ describe("App code workspace mode", () => {
     });
 
     const createButton = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("🚀 创建会话"),
+      node.textContent?.includes("🚀 新建任务"),
     ) as HTMLButtonElement | undefined;
     expect(createButton).toBeDefined();
 

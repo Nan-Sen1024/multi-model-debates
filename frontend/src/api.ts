@@ -10,6 +10,7 @@ import {
   SessionWorkspaceView,
   WorkspaceFileContentRecord,
   WorkspaceConfigRecord,
+  WorkspaceCapabilityManifest,
   StreamPayload,
 } from "./types";
 
@@ -95,6 +96,7 @@ export async function getWorkspaceFileContent(
 export async function previewWorkspace(input: {
   root_path: string;
   scan_excludes: string[];
+  capabilities?: WorkspaceCapabilityManifest | null;
 }): Promise<SessionWorkspaceView> {
   return request<SessionWorkspaceView>("/workspace/preview", {
     method: "POST",
@@ -306,6 +308,9 @@ export function openSessionStream(
     "turn_start",
     "phase_start",
     "phase_end",
+    "research_search",
+    "research_open_pages",
+    "research_note",
     "chunk",
     "reasoning_note",
     "model_request",
@@ -316,6 +321,7 @@ export function openSessionStream(
     "tool_output",
     "tool_result",
     "state_write",
+    "provider_fallback",
     "turn_end",
     "participant_error",
     "round_end",

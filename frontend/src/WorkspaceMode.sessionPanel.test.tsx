@@ -205,4 +205,69 @@ describe("WorkspaceSessionPanel file viewer", () => {
 
     expect(browser?.style.gridTemplateColumns).toContain("400px");
   });
+
+  test("shows discovered skills returned by the workspace runtime", async () => {
+    const workspace: SessionWorkspaceView = {
+      root_path: "D:/repo/demo",
+      display_name: "demo-repo",
+      repo_fingerprint: "fingerprint-123",
+      scan_excludes: [],
+      selected_paths: [],
+      index_status: "ready",
+      last_scanned_at: 1710000000,
+      summary: "2 files",
+      capabilities: {
+        skill_sources: [
+          {
+            path: "C:/Users/Nan/.codex/skills",
+            source_type: "local",
+            label: "Codex Skills",
+            recursive: true,
+            enabled: true,
+          },
+        ],
+        mcp_servers: [],
+        agent_defaults: {
+          mode: "tool_loop",
+          max_steps: 6,
+          can_write: false,
+          allowed_skills: [],
+          allowed_mcp_servers: [],
+          memory_scope: "workspace_shared",
+        },
+        participant_overrides: {},
+      },
+      discovered_skills: [
+        {
+          name: "ai-rd-workbench-product-owner",
+          description: "Productizes local AI workbenches",
+          summary: "Focus on Workspace, Task, Run, Review and Provider.",
+          path: "C:/Users/Nan/.codex/skills/ai-rd-workbench-product-owner/SKILL.md",
+          source_type: "local",
+          source_label: "Codex Skills",
+        },
+      ],
+      files: [],
+      tree: [],
+    };
+
+    await act(async () => {
+      root.render(
+        <WorkspaceSessionPanel
+          sessionId="workspace-session"
+          workspace={workspace}
+          participants={[{ custom_id: "claude", model_ref: "anthropic/claude-4.6" }]}
+          capabilities={workspace.capabilities}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("已发现技能");
+    expect(container.textContent).toContain("ai-rd-workbench-product-owner");
+    expect(container.textContent).toContain("Productizes local AI workbenches");
+    expect(container.textContent).toContain("Codex Skills");
+    expect(container.textContent).toContain("Agency Starter Pack");
+    expect(container.textContent).toContain("Analyze Repo with Product Lens");
+  });
 });

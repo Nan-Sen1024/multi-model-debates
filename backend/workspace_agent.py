@@ -56,6 +56,7 @@ class WorkspaceAgentRunner:
         model_stream_factory: Callable[[List[Dict[str, str]]], Awaitable[str]],
         persist_tool_message: PersistToolMessage,
         emit_event: Optional[EmitAgentEvent] = None,
+        latest_user_message: str = "",
     ) -> WorkspaceAgentRunResult:
         profile = resolve_workspace_agent_profile(
             session.config.workspace.capabilities if session.config.workspace else None,
@@ -77,15 +78,20 @@ class WorkspaceAgentRunner:
                 else [],
             )
 
+        if not _latest_user_request_expects_workspace_action(latest_user_message):
+            final_text = await model_stream_factory(prompt_messages)
+            return WorkspaceAgentRunResult(final_content=final_text)
+
         working_messages = list(prompt_messages)
         max_steps = max(1, int(profile.max_steps))
         extend_for_repair = _should_extend_step_budget(
             profile=profile,
-            prompt_messages=working_messages,
+            latest_user_message=latest_user_message,
         )
         step_budget_extended = False
         emitted_chunks: List[WorkspaceAgentEvent] = []
         persisted_messages: List[CollaborationMessage] = []
+        research_activity_detected = False
         step = 0
         while extend_for_repair or step < max_steps:
             step += 1
@@ -156,7 +162,7 @@ class WorkspaceAgentRunner:
             if directive is None:
                 if _should_retry_missing_tool_call(
                     profile=profile,
-                    prompt_messages=working_messages,
+                    latest_user_message=latest_user_message,
                     raw_output=raw_output,
                     persisted_messages=persisted_messages,
                 ):
@@ -180,6 +186,20 @@ class WorkspaceAgentRunner:
                     )
                     continue
                 if raw_output:
+                    if research_activity_detected:
+                        await _record_agent_event(
+                            emitted_chunks,
+                            WorkspaceAgentEvent(
+                                "research_note",
+                                participant_id=participant.custom_id,
+                                content=_truncate_event_content(raw_output, limit=4_000),
+                                round_number=round_number,
+                                metadata={
+                                    "summary": "研究补充说明",
+                                },
+                            ),
+                            emit_event,
+                        )
                     await _record_agent_event(
                         emitted_chunks,
                         WorkspaceAgentEvent(
@@ -207,7 +227,10 @@ class WorkspaceAgentRunner:
                     ),
                     emit_event,
                 )
-                if _should_continue_after_plan(profile=profile, prompt_messages=working_messages):
+                if _should_continue_after_plan(
+                    profile=profile,
+                    latest_user_message=latest_user_message,
+                ):
                     working_messages = build_plan_follow_up_messages(
                         working_messages,
                         directive.plan or raw_output,
@@ -326,6 +349,16 @@ class WorkspaceAgentRunner:
                 ),
             ]:
                 await _record_agent_event(emitted_chunks, event, emit_event)
+            for research_event in _build_research_events_from_tool(
+                participant_id=participant.custom_id,
+                round_number=round_number,
+                server_name=directive.server_name,
+                tool_name=directive.tool_name,
+                arguments=directive.arguments,
+                tool_text=tool_result.text,
+            ):
+                research_activity_detected = True
+                await _record_agent_event(emitted_chunks, research_event, emit_event)
             follow_up_messages = build_tool_result_follow_up_messages(
                 working_messages,
                 directive.server_name,
@@ -335,7 +368,7 @@ class WorkspaceAgentRunner:
             working_messages = follow_up_messages
             continue
 
-        max_step_message = "workspace agent 达到最大执行步数，已停止。"
+        max_step_message = "本轮执行已暂停：达到当前步数预算。"
         max_step_code = "AGENT_MAX_STEPS"
         max_step_event = WorkspaceAgentEvent(
             "participant_error",
@@ -423,22 +456,160 @@ async def _record_agent_event(
         await emit_event(event)
 
 
+def _build_research_events_from_tool(
+    *,
+    participant_id: str,
+    round_number: int,
+    server_name: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    tool_text: str,
+) -> List[WorkspaceAgentEvent]:
+    if server_name != "web":
+        return []
+    parsed_payload = _parse_json_object(tool_text)
+    if tool_name == "search_query":
+        query = _extract_research_query(arguments, parsed_payload)
+        result_count = _coerce_int(parsed_payload.get("result_count"))
+        metadata: Dict[str, object] = {
+            "server_name": server_name,
+            "tool_name": tool_name,
+            "summary": (
+                f"搜索到 {result_count} 个网页"
+                if result_count is not None
+                else ("已发起网页搜索" if query else "网页搜索完成")
+            ),
+        }
+        if query:
+            metadata["query"] = query
+        if result_count is not None:
+            metadata["result_count"] = result_count
+        return [
+            WorkspaceAgentEvent(
+                "research_search",
+                participant_id=participant_id,
+                round_number=round_number,
+                metadata=metadata,
+            )
+        ]
+    if tool_name == "open":
+        items = _coerce_string_list(arguments.get("items"))
+        if not items:
+            items = _coerce_string_list(parsed_payload.get("items"))
+        page_count = (
+            _coerce_int(arguments.get("page_count"))
+            or _coerce_int(parsed_payload.get("page_count"))
+            or (len(items) if items else None)
+        )
+        metadata = {
+            "server_name": server_name,
+            "tool_name": tool_name,
+            "summary": (
+                f"浏览 {page_count} 个页面"
+                if page_count is not None
+                else ("浏览研究页面" if items else "打开研究结果页面")
+            ),
+        }
+        if page_count is not None:
+            metadata["page_count"] = page_count
+        if items:
+            metadata["items"] = items
+        return [
+            WorkspaceAgentEvent(
+                "research_open_pages",
+                participant_id=participant_id,
+                round_number=round_number,
+                metadata=metadata,
+            )
+        ]
+    return []
+
+
+def _parse_json_object(text: str) -> Dict[str, object]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return {}
+    try:
+        payload = json.loads(normalized)
+    except json.JSONDecodeError:
+        payload = _extract_first_json_object(normalized)
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _extract_research_query(arguments: Dict[str, Any], parsed_payload: Dict[str, object]) -> Optional[str]:
+    for candidate in (
+        parsed_payload.get("query"),
+        arguments.get("query"),
+        arguments.get("q"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    batched_queries = arguments.get("search_query")
+    if isinstance(batched_queries, list):
+        for item in batched_queries:
+            if not isinstance(item, dict):
+                continue
+            for key in ("query", "q"):
+                candidate = item.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+    return None
+
+
+def _coerce_int(value: object) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        try:
+            return int(normalized)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_string_list(value: object) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    items: List[str] = []
+    for raw_item in value:
+        if isinstance(raw_item, str):
+            candidate = raw_item.strip()
+        elif isinstance(raw_item, dict):
+            candidate_value = _first_payload_value(raw_item, ("title", "name", "label", "text"))
+            candidate = candidate_value.strip() if isinstance(candidate_value, str) else ""
+        else:
+            candidate = ""
+        if candidate and candidate not in items:
+            items.append(candidate)
+    return items
+
+
 def _should_extend_step_budget(
     *,
     profile: AgentProfileConfig,
-    prompt_messages: List[Dict[str, str]],
+    latest_user_message: str,
 ) -> bool:
-    return bool(getattr(profile, "can_write", False)) and _latest_user_request_expects_workspace_action(
-        prompt_messages
+    if not bool(getattr(profile, "can_write", False)):
+        return False
+    return (
+        _latest_user_request_requires_code_changes(latest_user_message)
+        or _latest_user_request_signals_continuation(latest_user_message)
     )
 
 
 def _should_continue_after_plan(
     *,
     profile: AgentProfileConfig,
-    prompt_messages: List[Dict[str, str]],
+    latest_user_message: str,
 ) -> bool:
-    return _should_extend_step_budget(profile=profile, prompt_messages=prompt_messages)
+    return _should_extend_step_budget(profile=profile, latest_user_message=latest_user_message)
 
 
 def parse_workspace_agent_directive(text: str) -> Optional[WorkspaceAgentDirective]:
@@ -559,7 +730,7 @@ def _write_arguments_from_payload(
     if isinstance(files, list):
         first_file = next((item for item in files if isinstance(item, dict)), None)
         if isinstance(first_file, dict):
-            source = first_file  # type: ignore[assignment]
+            source = first_file
 
     if "path" not in arguments:
         path = _first_payload_value(source, ("path", "file_path", "filepath", "file", "filename"))
@@ -574,11 +745,21 @@ def _write_arguments_from_payload(
     return arguments
 
 
-def _looks_like_command_payload(payload: dict[str, object]) -> bool:
+def _payload_str(payload: Dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _payload_dict(payload: Dict[str, object], key: str) -> Dict[str, Any]:
+    value = payload.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _looks_like_command_payload(payload: Dict[str, object]) -> bool:
     return any(key in payload for key in ("command", "cmd", "argv", "command_line", "shell_command", "script"))
 
 
-def _looks_like_write_payload(payload: dict[str, object]) -> bool:
+def _looks_like_write_payload(payload: Dict[str, object]) -> bool:
     if isinstance(payload.get("content"), str) and any(
         key in payload for key in ("path", "file_path", "filepath", "file", "filename")
     ):
@@ -589,8 +770,8 @@ def _looks_like_write_payload(payload: dict[str, object]) -> bool:
     return False
 
 
-def _normalize_tool_name(tool_name: str) -> str:
-    normalized = tool_name.strip().lower()
+def _normalize_tool_name(name: str) -> str:
+    normalized = name.strip().lower()
     aliases = {
         "command": "run_command",
         "cmd": "run_command",
@@ -605,102 +786,92 @@ def _normalize_tool_name(tool_name: str) -> str:
     return aliases.get(normalized, normalized)
 
 
-def _payload_str(payload: dict[str, object], key: str) -> str:
-    value = payload.get(key)
-    return value.strip() if isinstance(value, str) else ""
+def _strip_json_code_fence(text: str) -> str:
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return text
 
 
-def _payload_dict(payload: dict[str, object], key: str) -> Dict[str, Any]:
-    value = payload.get(key)
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _first_payload_value(payload: dict[str, object], keys: tuple[str, ...]) -> object:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, str):
-            if value.strip():
-                return value
+def _extract_first_json_object(text: str) -> Optional[dict[str, object]]:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
             continue
-        if value is not None:
-            return value
+        try:
+            payload, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
     return None
 
 
-def build_tool_result_follow_up_messages(
-    prompt_messages: List[Dict[str, str]],
-    server_name: str,
-    tool_name: str,
-    tool_text: str,
-) -> List[Dict[str, str]]:
-    return [
-        *prompt_messages,
-        {
-            "role": "user",
-            "content": (
-                f"[工具执行结果]\n"
-                f"server={server_name}\n"
-                f"tool={tool_name}\n"
-                f"output:\n{tool_text}\n\n"
-                "请基于工具结果继续判断是否还需要修改文件或运行验证命令。"
-                "如果任务要求修复、实现、更新代码或执行本地验证，不要停在解释层面。"
-                "如果任务还没有修复完成，请继续发起 tool_call；"
-                "如果命令失败，请根据输出继续修改文件并再次运行验证命令；"
-                "只有在修改完成并验证通过后，才输出最终答复。"
-                "最终答复请简洁列出：修改了哪些文件、运行了哪些命令、验证结果如何、是否仍有阻塞。"
-            ),
-        },
-    ]
+def _latest_user_request_requires_code_changes(latest_user_message: str) -> bool:
+    latest_request = _normalize_workspace_user_request(latest_user_message)
+    if not latest_request:
+        return False
+    normalized = latest_request.lower()
+    return any(keyword in normalized for keyword in _WORKSPACE_WRITE_KEYWORDS)
 
 
-def build_plan_follow_up_messages(
-    prompt_messages: List[Dict[str, str]],
-    plan_text: str,
-) -> List[Dict[str, str]]:
-    return [
-        *prompt_messages,
-        {
-            "role": "assistant",
-            "content": plan_text,
-        },
-        {
-            "role": "user",
-            "content": (
-                "计划已记录并展示。当前是可写 code_workspace 修复任务，不能在计划阶段停止。"
-                "请立即继续执行，只输出一个 workspace tool_call JSON。"
-                "先读取必要文件，再写入修复，随后运行验证命令。"
-                "只有在代码已修改且验证通过或明确阻塞后，才输出最终总结。"
-            ),
-        },
-    ]
+def _latest_user_request_signals_continuation(latest_user_message: str) -> bool:
+    latest_request = _normalize_workspace_user_request(latest_user_message)
+    if not latest_request:
+        return False
+    normalized = latest_request.lower()
+    return any(keyword in normalized for keyword in _WORKSPACE_CONTINUATION_KEYWORDS)
 
 
-def build_step_budget_extension_follow_up_messages(
-    prompt_messages: List[Dict[str, str]],
+def _latest_user_request_expects_workspace_action(latest_user_message: str) -> bool:
+    latest_request = _normalize_workspace_user_request(latest_user_message)
+    if not latest_request:
+        return False
+    normalized = latest_request.lower()
+    return any(keyword in normalized for keyword in _WORKSPACE_ACTION_KEYWORDS)
+
+
+def _looks_like_incomplete_or_promissory_output(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return True
+    if any(marker in normalized for marker in _WORKSPACE_COMPLETION_MARKERS):
+        return False
+    normalized = normalized.replace("剩余阻塞：暂无", "")
+    normalized = normalized.replace("remaining blocker: none", "")
+    if any(marker in normalized for marker in _INCOMPLETE_OR_PROMISSORY_MARKERS):
+        return True
+    return any(normalized.startswith(marker) for marker in _INCOMPLETE_OR_PROMISSORY_PREFIXES)
+
+
+def _should_retry_missing_tool_call(
     *,
-    max_steps: int,
-) -> List[Dict[str, str]]:
-    return [
-        *prompt_messages,
-        {
-            "role": "user",
-            "content": (
-                f"你已经用完配置步数 {max_steps}，但当前修复尚未完成。"
-                "系统已进入持续修复循环，不会再因为步数上限停止。"
-                "不要总结未完成状态；继续发起下一个 workspace tool_call。"
-                "如果刚才命令失败，请根据输出修改文件并重新验证。"
-                "如果已经验证通过，请输出最终总结，列出修改文件、执行命令、验证结果和剩余风险。"
-            ),
-        },
-    ]
+    profile: AgentProfileConfig,
+    latest_user_message: str,
+    raw_output: str,
+    persisted_messages: List[CollaborationMessage],
+) -> bool:
+    if not bool(getattr(profile, "can_write", False)):
+        return False
+    if not _latest_user_request_expects_workspace_action(latest_user_message):
+        return False
+    if not _should_extend_step_budget(
+        profile=profile,
+        latest_user_message=latest_user_message,
+    ):
+        return False
+    if not persisted_messages:
+        return True
+    return _looks_like_incomplete_or_promissory_output(raw_output)
 
 
 def build_missing_tool_call_follow_up_messages(
-    prompt_messages: List[Dict[str, str]],
+    working_messages: List[Dict[str, str]],
     raw_output: str,
 ) -> List[Dict[str, str]]:
     return [
-        *prompt_messages,
+        *working_messages,
         {
             "role": "assistant",
             "content": raw_output,
@@ -722,71 +893,161 @@ def build_missing_tool_call_follow_up_messages(
     ]
 
 
-def _strip_json_code_fence(text: str) -> str:
-    if text.startswith("```") and text.endswith("```"):
-        lines = text.splitlines()
-        if len(lines) >= 3:
-            return "\n".join(lines[1:-1]).strip()
-    return text
-
-
-def _should_retry_missing_tool_call(
+def _should_continue_after_plan(
     *,
     profile: AgentProfileConfig,
-    prompt_messages: List[Dict[str, str]],
-    raw_output: str,
-    persisted_messages: List[CollaborationMessage],
+    latest_user_message: str,
 ) -> bool:
-    if not bool(getattr(profile, "can_write", False)):
-        return False
-    if not _latest_user_request_expects_workspace_action(prompt_messages):
-        return False
-    if not persisted_messages:
-        return True
-    return _looks_like_incomplete_or_promissory_output(raw_output)
+    return _should_extend_step_budget(profile=profile, latest_user_message=latest_user_message)
 
 
-def _latest_user_request_expects_workspace_action(prompt_messages: List[Dict[str, str]]) -> bool:
-    latest_request = _latest_user_intervention_text(prompt_messages)
-    if not latest_request:
-        return False
-    normalized = latest_request.lower()
-    return any(keyword in normalized for keyword in _WORKSPACE_ACTION_KEYWORDS)
+def build_plan_follow_up_messages(
+    working_messages: List[Dict[str, str]],
+    plan_text: str,
+) -> List[Dict[str, str]]:
+    return [
+        *working_messages,
+        {
+            "role": "assistant",
+            "content": plan_text,
+        },
+        {
+            "role": "user",
+            "content": (
+                "计划已记录并展示。当前是可写 code_workspace 修复任务，不能在计划阶段停止。"
+                "请立即继续执行，只输出一个 workspace tool_call JSON。"
+                "先读取必要文件，再写入修复，随后运行验证命令。"
+                "只有在代码已修改且验证通过或明确阻塞后，才输出最终总结。"
+            ),
+        },
+    ]
 
 
-def _latest_user_intervention_text(prompt_messages: List[Dict[str, str]]) -> str:
-    for message in reversed(prompt_messages):
-        if not isinstance(message, dict) or message.get("role") != "user":
+def build_step_budget_extension_follow_up_messages(
+    working_messages: List[Dict[str, str]],
+    *,
+    max_steps: int,
+) -> List[Dict[str, str]]:
+    return [
+        *working_messages,
+        {
+            "role": "user",
+            "content": (
+                f"你已经用完配置步数 {max_steps}，但当前修复尚未完成。"
+                "系统已进入持续修复循环，不会再因为步数上限停止。"
+                "不要总结未完成状态；继续发起下一个 workspace tool_call。"
+                "如果刚才命令失败，请根据输出修改文件并重新验证。"
+                "如果已经验证通过，请输出最终总结，列出修改文件、执行命令、验证结果和剩余风险。"
+            ),
+        },
+    ]
+
+
+def build_tool_result_follow_up_messages(
+    working_messages: List[Dict[str, str]],
+    server_name: str,
+    tool_name: str,
+    tool_text: str,
+) -> List[Dict[str, str]]:
+    return [
+        *working_messages,
+        {
+            "role": "user",
+            "content": (
+                f"[工具执行结果]\n"
+                f"server={server_name}\n"
+                f"tool={tool_name}\n"
+                f"output:\n{tool_text}\n\n"
+                "请基于工具结果继续判断是否还需要修改文件或运行验证命令。"
+                "如果任务要求修复、实现、更新代码或执行本地验证，不要停在解释层面。"
+                "如果任务还没有修复完成，请继续发起 tool_call；"
+                "如果命令失败，请根据输出继续修改文件并再次运行验证命令；"
+                "只有在修改完成并验证通过后，才输出最终答复。"
+                "最终答复请简洁列出：修改了哪些文件、运行了哪些命令、验证结果如何、是否仍有阻塞。"
+            ),
+        },
+    ]
+
+
+def _truncate_event_content(text: str, *, limit: int = 800) -> str:
+    value = text or ""
+    return value if len(value) <= limit else value[:limit] + "..."
+
+
+def _first_payload_value(payload: dict[str, object], keys: tuple[str, ...]) -> object:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return value
             continue
-        content = str(message.get("content") or "")
-        matches = list(_USER_INTERVENTION_PATTERN.finditer(content))
-        if matches:
-            return matches[-1].group(1).strip()
-        if content.strip():
-            return content.strip()
-    return ""
+        if value is not None:
+            return value
+    return None
 
 
-def _looks_like_incomplete_or_promissory_output(raw_output: str) -> bool:
-    normalized = raw_output.strip().lower()
-    if not normalized:
-        return True
-    return any(marker in normalized for marker in _INCOMPLETE_OR_PROMISSORY_MARKERS)
+def _normalize_workspace_user_request(latest_user_message: str) -> str:
+    if not latest_user_message:
+        return ""
+    stripped = _WORKSPACE_MENTION_PATTERN.sub(" ", latest_user_message)
+    return re.sub(r"\s+", " ", stripped).strip()
 
 
-def _truncate_event_content(text: str, limit: int = 1_000) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}\n... [truncated {len(text) - limit} characters]"
-
-
-_USER_INTERVENTION_PATTERN = re.compile(
-    r"\[\[用户\]\|user_intervention\]: (.*?)(?=\n\[[^\n]+\|[a-z_]+\]:|\Z)",
-    re.S,
-)
+_WORKSPACE_MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9._%+-])[@＠][A-Za-z0-9_.-]+\s*")
 _WORKSPACE_ACTION_KEYWORDS = (
-    "修复",
+    "继续",
     "继续修",
+    "继续执行",
+    "读取",
+    "查看",
+    "阅读",
+    "分析",
+    "审查",
+    "评审",
+    "检查",
+    "排查",
+    "诊断",
+    "漏洞",
+    "安全",
+    "问题",
+    "bug",
+    "修复",
+    "可以修",
+    "直接执行",
+    "执行命令",
+    "运行命令",
+    "写入",
+    "修改",
+    "落地",
+    "跑验证",
+    "验证",
+    "补丁",
+    "改代码",
+    "fix",
+    "repair",
+    "patch",
+    "implement",
+    "update",
+    "modify",
+    "edit",
+    "write",
+    "run",
+    "execute",
+    "verify",
+    "test",
+    "read",
+    "inspect",
+    "review",
+    "analyze",
+    "debug",
+    "check",
+    "continue",
+    "open",
+)
+_WORKSPACE_WRITE_KEYWORDS = (
+    "继续修",
+    "继续执行",
+    "修复",
     "可以修",
     "直接执行",
     "执行命令",
@@ -811,13 +1072,25 @@ _WORKSPACE_ACTION_KEYWORDS = (
     "verify",
     "test",
 )
+_WORKSPACE_CONTINUATION_KEYWORDS = (
+    "继续",
+    "继续实施",
+    "继续处理",
+    "继续推进",
+    "继续做",
+    "继续完成",
+    "接着做",
+    "接着修",
+    "continue",
+    "keep going",
+    "resume",
+)
 _INCOMPLETE_OR_PROMISSORY_MARKERS = (
     "我先",
     "我会",
     "我将",
     "准备",
     "下一步",
-    "继续",
     "还没",
     "未完成",
     "没有实际",
@@ -832,20 +1105,18 @@ _INCOMPLETE_OR_PROMISSORY_MARKERS = (
     "not complete",
     "blocked",
 )
-
-
-def _extract_first_json_object(text: str) -> Optional[dict[str, object]]:
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
-        try:
-            payload, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    return None
+_INCOMPLETE_OR_PROMISSORY_PREFIXES = (
+    "继续",
+    "continue",
+)
+_WORKSPACE_COMPLETION_MARKERS = (
+    "修复完成",
+    "已完成修复",
+    "验证通过",
+    "已验证通过",
+    "剩余阻塞：暂无",
+    "remaining blocker: none",
+)
 
 
 def _build_workspace_agent_failure_summary(
@@ -881,12 +1152,12 @@ def _build_workspace_agent_failure_summary(
 
     return "\n".join(
         [
-            "本轮未完成修复。",
+            "本轮已暂停，尚未完成。",
             f"- 参与者：{participant_id}",
             f"- 已执行的工具：{', '.join(tool_names) if tool_names else '无'}",
             f"- 已修改的文件：{', '.join(updated_files) if updated_files else '未确认'}",
             f"- 运行的命令：{'; '.join(commands) if commands else '无'}",
             "- 验证结果：未确认通过",
-            f"- 失败原因：{error_message}",
+            f"- 暂停原因：{error_message}",
         ]
     )

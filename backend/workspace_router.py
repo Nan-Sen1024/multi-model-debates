@@ -5,7 +5,7 @@ from typing import Iterable, List, Tuple
 
 from .models import ModelParticipant
 
-_MENTION_PATTERN = re.compile(r"@([A-Za-z0-9_.-]+)")
+_MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9._%+-])[@＠]([A-Za-z0-9_.-]+)")
 
 
 def extract_workspace_mentions(text: str) -> List[str]:
@@ -41,7 +41,7 @@ def resolve_workspace_targets_with_unknowns(
     active_participants = [participant for participant in participants if participant.is_active]
     mentions = extract_workspace_mentions(text)
     if not mentions:
-        return active_participants, []
+        return [], []
 
     mention_map = {participant.custom_id.lower(): participant for participant in active_participants}
     selected: List[ModelParticipant] = []

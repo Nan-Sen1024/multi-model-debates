@@ -172,7 +172,7 @@ describe("App session persistence", () => {
 
     expect(container.textContent).toContain("assistant reply");
     expect(container.textContent).toContain("history user");
-    expect(container.querySelector('[aria-label="Sessions"]')?.textContent).toContain("Restored topic");
+    expect(container.querySelector('[aria-label="Tasks and runs"]')?.textContent).toContain("Restored topic");
 
     const draftBox = Array.from(container.querySelectorAll("textarea")).find(
       (node) => (node as HTMLTextAreaElement).value === "draft for restored",

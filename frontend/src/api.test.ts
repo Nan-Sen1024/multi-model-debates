@@ -292,6 +292,67 @@ describe("openSessionStream", () => {
     ]);
   });
 
+  test("forwards protocol-level research events", () => {
+    const received: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    openSessionStream("session-7", (event, payload) => {
+      received.push({ event, payload: payload as Record<string, unknown> });
+    });
+
+    MockEventSource.instances[0].emit("research_search", {
+      participant_id: "deepseek",
+      round: 3,
+      query: "中美之间的大事件",
+      result_count: 43,
+      summary: "搜索到 43 个网页",
+    });
+    MockEventSource.instances[0].emit("research_open_pages", {
+      participant_id: "deepseek",
+      round: 3,
+      page_count: 13,
+      items: ["中美如何做大人工智能合作的蛋糕", "查看全部"],
+      summary: "浏览 13 个页面",
+    });
+    MockEventSource.instances[0].emit("research_note", {
+      participant_id: "deepseek",
+      round: 3,
+      content: "这些结果涵盖贸易、外交、军事、科技等多个方面。",
+      summary: "这些结果涵盖了多个方面",
+    });
+
+    expect(received).toEqual([
+      {
+        event: "research_search",
+        payload: {
+          participant_id: "deepseek",
+          round: 3,
+          query: "中美之间的大事件",
+          result_count: 43,
+          summary: "搜索到 43 个网页",
+        },
+      },
+      {
+        event: "research_open_pages",
+        payload: {
+          participant_id: "deepseek",
+          round: 3,
+          page_count: 13,
+          items: ["中美如何做大人工智能合作的蛋糕", "查看全部"],
+          summary: "浏览 13 个页面",
+        },
+      },
+      {
+        event: "research_note",
+        payload: {
+          participant_id: "deepseek",
+          round: 3,
+          content: "这些结果涵盖贸易、外交、军事、科技等多个方面。",
+          summary: "这些结果涵盖了多个方面",
+        },
+      },
+    ]);
+  });
+
   test("bypasses the CRA dev proxy for SSE in local development", () => {
     openSessionStream("session-dev", () => {});
 

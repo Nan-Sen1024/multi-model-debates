@@ -7,8 +7,16 @@ import type {
   SessionWorkspaceView,
   WorkspaceFileContentRecord,
   WorkspaceCapabilityManifest,
+  WorkspaceDiscoveredSkill,
   WorkspaceTreeEntry,
 } from "./types";
+import {
+  AGENCY_STARTER_PACK_PATHS,
+  buildWorkspacePresetBundle,
+  WorkspacePresetBundle,
+  WorkspaceTaskPresetRecommendation,
+  WorkspaceTeamPresetRecommendation,
+} from "./workspacePresets";
 
 export interface WorkspaceMCPDraft {
   name: string;
@@ -60,6 +68,8 @@ interface WorkspaceCreatePanelProps {
   draft: WorkspaceDraftState;
   aliases: string[];
   onChange: (update: WorkspaceDraftUpdate) => void;
+  onApplyTaskPreset?: (preset: WorkspaceTaskPresetRecommendation) => void;
+  onApplyTeamPreset?: (preset: WorkspaceTeamPresetRecommendation) => void;
 }
 
 interface WorkspaceSessionPanelProps {
@@ -234,6 +244,8 @@ export function WorkspaceCreatePanel({
   draft,
   aliases,
   onChange,
+  onApplyTaskPreset,
+  onApplyTeamPreset,
 }: WorkspaceCreatePanelProps): JSX.Element {
   const [preview, setPreview] = React.useState<SessionWorkspaceView | null>(null);
   const [previewLoading, setPreviewLoading] = React.useState(false);
@@ -241,11 +253,15 @@ export function WorkspaceCreatePanel({
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const selectedPaths = parseTextareaLines(draft.selectedPaths);
   const selectedPathSet = new Set(selectedPaths);
+  const presetBundle = React.useMemo(
+    () => buildWorkspacePresetBundle(preview),
+    [preview],
+  );
 
   React.useEffect(() => {
     setPreview(null);
     setPreviewError(null);
-  }, [draft.rootPath, draft.scanExcludes]);
+  }, [draft.rootPath, draft.scanExcludes, draft.skillSources]);
 
   const updateMCPServer = (index: number, patch: Partial<WorkspaceMCPDraft>) => {
     onChange((current) => ({
@@ -317,6 +333,14 @@ export function WorkspaceCreatePanel({
     onChange({ selectedPaths: serializeTextareaLines(next) });
   };
 
+  const applyAgencyStarterPack = () => {
+    const next = new Set([
+      ...parseTextareaLines(draft.skillSources),
+      ...AGENCY_STARTER_PACK_PATHS,
+    ]);
+    onChange({ skillSources: serializeTextareaLines(next) });
+  };
+
   const handlePreviewWorkspace = async () => {
     const rootPath = draft.rootPath.trim();
     if (!rootPath) {
@@ -330,6 +354,7 @@ export function WorkspaceCreatePanel({
       const scanPreview = await previewWorkspace({
         root_path: rootPath,
         scan_excludes: parseTextareaLines(draft.scanExcludes),
+        capabilities: buildWorkspaceCapabilitiesFromDraft(draft),
       });
       setPreview(scanPreview);
     } catch (error) {
@@ -438,6 +463,30 @@ export function WorkspaceCreatePanel({
               <span className="workspace-path">{preview.summary || "扫描完成"}</span>
             </div>
 
+            {preview.capabilities?.skill_sources.length ? (
+              <div className="stack">
+                <div className="panel-head compact">
+                  <h4 className="workspace-card-title">已发现技能</h4>
+                  <span className="badge">{preview.discovered_skills?.length || 0}</span>
+                </div>
+                <div className="workspace-path-list">
+                  {preview.capabilities.skill_sources.map((source) => (
+                    <span key={source.path} className="workspace-path">{source.path}</span>
+                  ))}
+                </div>
+                <WorkspaceDiscoveredSkillList
+                  skills={preview.discovered_skills || []}
+                  emptyMessage="已配置 skill source，但当前目录里还没有识别到 `SKILL.md`。"
+                />
+              </div>
+            ) : null}
+
+            <WorkspacePresetInsights
+              bundle={presetBundle}
+              onApplyTaskPreset={onApplyTaskPreset}
+              onApplyTeamPreset={onApplyTeamPreset}
+            />
+
             <div className="workspace-path-list">
               {selectedPaths.length > 0
                 ? selectedPaths.map((path) => <span key={path} className="workspace-path">{path}</span>)
@@ -501,7 +550,17 @@ export function WorkspaceCreatePanel({
             <section className="workspace-capability-card">
           <div className="panel-head compact">
             <h4 className="workspace-card-title">Skills</h4>
-            <span className="badge">{parseTextareaLines(draft.skillSources).length} 个来源</span>
+            <div className="row-actions">
+              <button
+                type="button"
+                className="ghost-button small"
+                data-workspace-skill-pack="agency-starter"
+                onClick={applyAgencyStarterPack}
+              >
+                Agency Starter Pack
+              </button>
+              <span className="badge">{parseTextareaLines(draft.skillSources).length} 个来源</span>
+            </div>
           </div>
           <label className="field">
             <span>技能来源（每行一个目录）</span>
@@ -515,6 +574,9 @@ export function WorkspaceCreatePanel({
           </label>
           <p className="hint-text">
             后端会在这些目录中扫描 `SKILL.md` 并把技能摘要注入 `code_workspace` prompt。
+          </p>
+          <p className="hint-text">
+            Starter Pack 会预填 Codex skills 和 `agency-agents` 常见目录，方便把外部角色库接成可扫描的 skill source。
           </p>
         </section>
 
@@ -967,6 +1029,11 @@ export function WorkspaceSessionPanel({
   const capabilityManifest = capabilities || workspace.capabilities || null;
   const workspaceCanWrite = Boolean(capabilityManifest?.agent_defaults.can_write);
   const showWriteModeCard = Boolean(capabilityManifest) || Boolean(onToggleWriteMode);
+  const discoveredSkills = workspace.discovered_skills || [];
+  const presetBundle = React.useMemo(
+    () => buildWorkspacePresetBundle(workspace),
+    [workspace],
+  );
 
   const handleToggleWriteMode = async () => {
     if (!onToggleWriteMode) {
@@ -1071,6 +1138,22 @@ export function WorkspaceSessionPanel({
                 ))
                 : <span className="muted-text">未配置技能来源</span>}
             </div>
+          </div>
+
+          <div className="workspace-card">
+            <div className="panel-head compact">
+              <h4 className="workspace-card-title">已发现技能</h4>
+              <span className="badge">{discoveredSkills.length}</span>
+            </div>
+            <WorkspaceDiscoveredSkillList
+              skills={discoveredSkills}
+              emptyMessage="当前工作区还没有返回 discovered skills。先确认 skill source 路径存在，并且目录里包含 `SKILL.md`。"
+            />
+          </div>
+
+          <div className="workspace-card">
+            <h4 className="workspace-card-title">推荐入口</h4>
+            <WorkspacePresetInsights bundle={presetBundle} />
           </div>
 
           <div className="workspace-card">
@@ -1276,4 +1359,170 @@ function defaultDirectoryExpanded(path: string, depth = 0): boolean {
 
 function clampPaneSize(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function WorkspacePresetInsights({
+  bundle,
+  onApplyTaskPreset,
+  onApplyTeamPreset,
+}: {
+  bundle: WorkspacePresetBundle;
+  onApplyTaskPreset?: (preset: WorkspaceTaskPresetRecommendation) => void;
+  onApplyTeamPreset?: (preset: WorkspaceTeamPresetRecommendation) => void;
+}): JSX.Element {
+  const { starter_pack: starterPack, task_presets: taskPresets, team_presets: teamPresets } = bundle;
+
+  return (
+    <div className="workspace-preset-stack">
+      <div className="workspace-preset-card" data-workspace-starter-pack={starterPack.id}>
+        <div className="workspace-preset-head">
+          <div>
+            <strong>{starterPack.label}</strong>
+            <div className="workspace-skill-summary">{starterPack.summary}</div>
+          </div>
+          <span className={`badge badge-${starterPack.status}`}>
+            {starterPack.status === "connected" ? "已接入" : "可接入"}
+          </span>
+        </div>
+        {starterPack.configured_sources.length > 0 ? (
+          <div className="workspace-path-list">
+            {starterPack.configured_sources.map((path) => (
+              <span key={path} className="workspace-path">{path}</span>
+            ))}
+          </div>
+        ) : (
+          <div className="muted-text">
+            还没有命中 Agency Starter Pack 路径。可直接用上面的快捷按钮预填 skill source。
+          </div>
+        )}
+        {starterPack.supporting_skill_names.length > 0 ? (
+          <div className="workspace-chip-row">
+            {starterPack.supporting_skill_names.map((name) => (
+              <span key={name} className="workspace-chip">{name}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+
+      {taskPresets.length > 0 ? (
+        <div className="workspace-preset-card">
+          <div className="panel-head compact">
+            <h4 className="workspace-card-title">建议 Task Presets</h4>
+            <span className="badge">{taskPresets.length}</span>
+          </div>
+          <div className="workspace-preset-list">
+            {taskPresets.map((preset) => (
+              <div key={preset.id} className="workspace-preset-item">
+                <div className="workspace-preset-head">
+                  <div>
+                    <strong>{preset.label}</strong>
+                    <div className="workspace-skill-description">{preset.summary}</div>
+                  </div>
+                  <span className="workspace-path">{preset.mode}</span>
+                </div>
+                {preset.supporting_skill_names.length > 0 ? (
+                  <div className="workspace-chip-row">
+                    {preset.supporting_skill_names.map((name) => (
+                      <span key={name} className="workspace-chip">{name}</span>
+                    ))}
+                  </div>
+                ) : null}
+                {onApplyTaskPreset ? (
+                  <div className="row-actions">
+                    <button
+                      type="button"
+                      className="ghost-button small"
+                      data-workspace-task-preset={preset.id}
+                      onClick={() => onApplyTaskPreset(preset)}
+                    >
+                      用作任务目标
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {teamPresets.length > 0 ? (
+        <div className="workspace-preset-card">
+          <div className="panel-head compact">
+            <h4 className="workspace-card-title">建议 Team Presets</h4>
+            <span className="badge">{teamPresets.length}</span>
+          </div>
+          <div className="workspace-preset-list">
+            {teamPresets.map((preset) => (
+              <div key={preset.id} className="workspace-preset-item">
+                <div className="workspace-preset-head">
+                  <div>
+                    <strong>{preset.label}</strong>
+                    <div className="workspace-skill-description">{preset.summary}</div>
+                  </div>
+                  <span className="workspace-path">{preset.roles.length} 个角色</span>
+                </div>
+                <div className="workspace-team-role-list">
+                  {preset.roles.map((role) => (
+                    <div key={`${preset.id}-${role.alias}`} className="workspace-team-role">
+                      <strong>@{role.alias}</strong>
+                      <span>{role.role_desc}</span>
+                    </div>
+                  ))}
+                </div>
+                {onApplyTeamPreset ? (
+                  <div className="row-actions">
+                    <button
+                      type="button"
+                      className="ghost-button small"
+                      data-workspace-team-preset={preset.id}
+                      onClick={() => onApplyTeamPreset(preset)}
+                    >
+                      填充参与者
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function WorkspaceDiscoveredSkillList({
+  skills,
+  emptyMessage,
+}: {
+  skills: WorkspaceDiscoveredSkill[];
+  emptyMessage: string;
+}): JSX.Element {
+  if (!skills.length) {
+    return <div className="muted-text">{emptyMessage}</div>;
+  }
+
+  return (
+    <div className="workspace-skill-list">
+      {skills.map((skill) => (
+        <div
+          key={`${skill.name}-${skill.path}`}
+          className="workspace-skill-card"
+          data-workspace-discovered-skill={skill.name}
+        >
+          <div className="workspace-skill-head">
+            <strong>{skill.name}</strong>
+            <span className="workspace-path">{summarizeDiscoveredSkillSource(skill)}</span>
+          </div>
+          <div className="workspace-skill-description">{skill.description}</div>
+          {skill.summary ? (
+            <div className="workspace-skill-summary">{skill.summary}</div>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function summarizeDiscoveredSkillSource(skill: WorkspaceDiscoveredSkill): string {
+  return skill.source_label || skill.source_type || "未标注来源";
 }

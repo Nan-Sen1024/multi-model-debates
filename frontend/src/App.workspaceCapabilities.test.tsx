@@ -56,15 +56,31 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
-    expect(createSessionTab).toBeDefined();
+    expect(createTaskTab).toBeDefined();
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
+
+    expect(container.textContent).toContain("Analyze Repo");
+    expect(container.textContent).toContain("实验模式");
+    expect(container.textContent).not.toContain("狼人杀");
+
+    const labsToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("实验模式"),
+    ) as HTMLButtonElement | undefined;
+    expect(labsToggle).toBeDefined();
+
+    await act(async () => {
+      labsToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("代码工作区");
 
     const workspaceCard = Array.from(container.querySelectorAll(".mode-card")).find((node) =>
       node.textContent?.includes("代码工作区"),
@@ -102,6 +118,79 @@ describe("App workspace capability editor", () => {
     expect(container.querySelector('input[name="workspace-mcp-name-0"]')).not.toBeNull();
     expect(container.querySelector('select[name="workspace-agent-mode"]')).not.toBeNull();
     expect(container.querySelector('textarea[name="workspace-override-skills-Model_A"]')).not.toBeNull();
+  });
+
+  test("offers an Agency Starter Pack shortcut for workspace skill sources", async () => {
+    jest.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/providers") {
+        return mockJsonResponse([]);
+      }
+      if (path === "/api/sessions") {
+        return mockJsonResponse([]);
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    await act(async () => {
+      root.render(React.createElement(App));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const labsToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("实验模式"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      labsToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const workspaceCard = Array.from(container.querySelectorAll(".mode-card")).find((node) =>
+      node.textContent?.includes("代码工作区"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      workspaceCard?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const advancedToggle = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("高级配置"),
+    ) as HTMLButtonElement | undefined;
+
+    await act(async () => {
+      advancedToggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    const starterPackButton = container.querySelector(
+      'button[data-workspace-skill-pack="agency-starter"]',
+    ) as HTMLButtonElement | null;
+    const skillSourcesInput = container.querySelector(
+      'textarea[name="workspace-skill-sources"]',
+    ) as HTMLTextAreaElement | null;
+
+    expect(starterPackButton).not.toBeNull();
+    expect(skillSourcesInput).not.toBeNull();
+
+    await act(async () => {
+      starterPackButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(skillSourcesInput?.value).toContain(".codex/skills");
+    expect(skillSourcesInput?.value).toContain("agency-agents");
   });
 
   test("submits a minimal workspace capability manifest for default code workspace sessions", async () => {
@@ -205,12 +294,12 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 
@@ -234,7 +323,7 @@ describe("App workspace capability editor", () => {
     });
 
     const submitButton = Array.from(container.querySelectorAll("button")).find(
-      (node) => node.textContent?.trim() === "🚀 创建会话",
+      (node) => node.textContent?.trim() === "🚀 新建任务",
     ) as HTMLButtonElement | undefined;
     expect(submitButton).toBeDefined();
 
@@ -379,12 +468,12 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 
@@ -505,7 +594,7 @@ describe("App workspace capability editor", () => {
     });
 
     const submitButton = Array.from(container.querySelectorAll("button")).find(
-      (node) => node.textContent?.trim() === "🚀 创建会话",
+      (node) => node.textContent?.trim() === "🚀 新建任务",
     ) as HTMLButtonElement | undefined;
     expect(submitButton).toBeDefined();
 
@@ -582,12 +671,12 @@ describe("App workspace capability editor", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 

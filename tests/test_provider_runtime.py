@@ -364,6 +364,12 @@ def test_explicit_provider_uses_compatible_default_model_fallback(tmp_path):
 
     assert [call["provider_config"].name for call in gateway.calls] == ["cc", "waicc"]
     assert any(
+        event.event == "provider_fallback"
+        and event.metadata.get("provider_name") == "cc"
+        and event.metadata.get("fallback_provider_name") == "waicc"
+        for event in events
+    )
+    assert any(
         event.event == "participant_error"
         and event.metadata.get("code") == "AUTHENTICATION_REQUIRED"
         and event.metadata.get("model_ref") == "gpt-5.4"
@@ -371,6 +377,70 @@ def test_explicit_provider_uses_compatible_default_model_fallback(tmp_path):
         for event in events
     )
     assert any(event.event == "chunk" and event.content == "fallback response" for event in events)
+
+
+def test_explicit_provider_falls_back_to_same_type_provider_for_bare_model_ref(tmp_path):
+    db_path = str(tmp_path / "provider-same-type-fallback.db")
+    gateway = FlakyGateway([
+        AuthenticationError("token invalid"),
+        ["fallback response"],
+    ])
+    orchestrator = SessionOrchestrator(db_path=db_path, gateway=gateway)
+    run(insert_provider(db_path, "provider-waicc", "waicc", ProviderType.OPENAI, "http://api.example.test/v1"))
+    run(insert_provider(db_path, "provider-openai", "openai", ProviderType.OPENAI, "https://api.openai.com/v1"))
+
+    session = run(
+        orchestrator.create_session(
+            CreateSessionRequest(
+                topic="test same type provider fallback",
+                mode=CollaborationMode.CHAT,
+                participants=[
+                    ParticipantInput(
+                        model_ref="gpt-5.4",
+                        provider_id="provider-waicc",
+                        custom_id="A",
+                    ),
+                    ParticipantInput(model_ref="openai/gpt-4o", custom_id="B"),
+                ],
+            )
+        )
+    )
+
+    events = run(collect_events(orchestrator, session.id))
+
+    assert [call["provider_config"].name for call in gateway.calls] == ["waicc", "openai"]
+    assert any(
+        event.event == "provider_fallback"
+        and event.metadata.get("provider_name") == "waicc"
+        and event.metadata.get("fallback_provider_name") == "openai"
+        for event in events
+    )
+    assert any(
+        event.event == "participant_error"
+        and event.metadata.get("code") == "AUTHENTICATION_REQUIRED"
+        and event.metadata.get("provider_name") == "waicc"
+        for event in events
+    )
+    assert any(event.event == "chunk" and event.content == "fallback response" for event in events)
+
+    async def load_diagnostic():
+        await init_db(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                "SELECT last_diagnostic FROM provider_configs WHERE id = ?",
+                ("provider-waicc",),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return json.loads(row[0])
+
+    diagnostic = run(load_diagnostic())
+
+    assert diagnostic["healthy"] is False
+    assert diagnostic["fallback_provider_name"] == "openai"
+    assert [item["status"] for item in diagnostic["history"]] == [
+        "failed",
+        "fallback_active",
+    ]
 
 
 def test_dispatch_persists_provider_oauth_refresh_update(tmp_path):
@@ -416,6 +486,98 @@ def test_dispatch_persists_provider_oauth_refresh_update(tmp_path):
     assert persisted_auth.oauth_token.access_token == "new-access-token"
     assert persisted_auth.oauth_token.refresh_token == "new-refresh-token"
     assert persisted_auth.metadata["account_id"] == "acct-new"
+
+
+def test_successful_primary_provider_persists_recovery_after_prior_failure(tmp_path):
+    db_path = str(tmp_path / "provider-recovery.db")
+    gateway = FakeGateway()
+    orchestrator = SessionOrchestrator(db_path=db_path, gateway=gateway)
+    run(insert_provider(db_path, "provider-openai", "openai-primary", ProviderType.OPENAI, "https://api.openai.com/v1"))
+
+    async def seed_failure():
+        await init_db(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "UPDATE provider_configs SET last_diagnostic = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "healthy": False,
+                            "code": "AUTHENTICATION_REQUIRED",
+                            "summary": "主路鉴权失败，已切换 fallback",
+                            "message": "API key invalid",
+                            "checked_at": 1710000000,
+                            "source": "session_runtime",
+                            "fallback_provider_id": "provider-backup",
+                            "fallback_provider_name": "openai-backup",
+                            "history": [
+                                {
+                                    "status": "failed",
+                                    "code": "AUTHENTICATION_REQUIRED",
+                                    "summary": "主路鉴权失败",
+                                    "message": "API key invalid",
+                                    "checked_at": 1710000000,
+                                },
+                                {
+                                    "status": "fallback_active",
+                                    "code": "AUTHENTICATION_REQUIRED",
+                                    "summary": "已切换到 openai-backup",
+                                    "message": "Fallback 接管流量",
+                                    "checked_at": 1710000001,
+                                },
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "provider-openai",
+                ),
+            )
+            await db.commit()
+
+    run(seed_failure())
+
+    session = run(
+        orchestrator.create_session(
+            CreateSessionRequest(
+                topic="test recovery detection",
+                mode=CollaborationMode.CHAT,
+                participants=[
+                    ParticipantInput(
+                        model_ref="openai/gpt-4o",
+                        provider_id="provider-openai",
+                        custom_id="A",
+                    ),
+                    ParticipantInput(
+                        model_ref="anthropic/claude-3-5-sonnet",
+                        custom_id="B",
+                    ),
+                ],
+            )
+        )
+    )
+
+    run(collect_events(orchestrator, session.id))
+
+    async def load_diagnostic():
+        await init_db(db_path)
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                "SELECT last_diagnostic FROM provider_configs WHERE id = ?",
+                ("provider-openai",),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return json.loads(row[0])
+
+    diagnostic = run(load_diagnostic())
+
+    assert diagnostic["healthy"] is True
+    assert diagnostic["summary"] == "主路恢复"
+    assert diagnostic["fallback_provider_name"] is None
+    assert [item["status"] for item in diagnostic["history"]] == [
+        "failed",
+        "fallback_active",
+        "recovered",
+    ]
 
 
 def test_append_participants_accepts_bare_model_ref_when_provider_is_bound(tmp_path):

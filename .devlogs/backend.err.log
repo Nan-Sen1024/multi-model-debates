@@ -1,0 +1,29 @@
+INFO:     Started server process [12876]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+Provider waicc failed before emitting output for wg54
+Provider cc failed before emitting output for wg54
+Provider openai failed before emitting output for wg54
+'[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1010)' thrown while requesting HEAD https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/adapter_config.json
+Retrying in 1s [Retry 1/5].
+DriftDetector model load failed, degraded mode remains active: Cannot send a request, as the client has been closed.
+Provider waicc failed before emitting output for wg54
+Provider cc failed before emitting output for wg54
+Provider openai failed before emitting output for wg54
+Provider waicc failed before emitting output for wg5-3-codex
+C:\Users\Nan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pydantic\main.py:464: UserWarning: Pydantic serializer warnings:
+  PydanticSerializationUnexpectedValue(Expected `ResponseAPIUsage` - serialized value may not be as expected [field_name='usage', input_value={'completion_tokens': 215..., 'video_tokens': None}}, input_type=dict])
+  return self.__pydantic_serializer__.to_python(
+Provider waicc failed before emitting output for wg5-3-codex
+C:\Users\Nan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pydantic\main.py:464: UserWarning: Pydantic serializer warnings:
+  PydanticSerializationUnexpectedValue(Expected `ResponseAPIUsage` - serialized value may not be as expected [field_name='usage', input_value={'completion_tokens': 27,..., 'video_tokens': None}}, input_type=dict])
+  return self.__pydantic_serializer__.to_python(
+Provider waicc failed before emitting output for wg5-3-codex
+C:\Users\Nan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pydantic\main.py:464: UserWarning: Pydantic serializer warnings:
+  PydanticSerializationUnexpectedValue(Expected `ResponseAPIUsage` - serialized value may not be as expected [field_name='usage', input_value={'completion_tokens': 29,..., 'video_tokens': None}}, input_type=dict])
+  return self.__pydantic_serializer__.to_python(
+Provider waicc failed before emitting output for wg5-3-codex
+C:\Users\Nan\AppData\Local\Programs\Python\Python312\Lib\site-packages\pydantic\main.py:464: UserWarning: Pydantic serializer warnings:
+  PydanticSerializationUnexpectedValue(Expected `ResponseAPIUsage` - serialized value may not be as expected [field_name='usage', input_value={'completion_tokens': 547..., 'video_tokens': None}}, input_type=dict])
+  return self.__pydantic_serializer__.to_python(

@@ -21,6 +21,9 @@ export type StreamEventType =
   | "turn_start"
   | "phase_start"
   | "phase_end"
+  | "research_search"
+  | "research_open_pages"
+  | "research_note"
   | "chunk"
   | "reasoning_note"
   | "model_request"
@@ -31,6 +34,7 @@ export type StreamEventType =
   | "tool_output"
   | "tool_result"
   | "state_write"
+  | "provider_fallback"
   | "turn_end"
   | "participant_error"
   | "round_end"
@@ -124,6 +128,7 @@ export interface WorkspaceTreeEntry {
 }
 
 export interface SessionWorkspaceView extends WorkspaceConfigRecord {
+  discovered_skills?: WorkspaceDiscoveredSkill[];
   files: string[];
   tree: WorkspaceTreeEntry[];
 }
@@ -145,6 +150,23 @@ export interface ProviderRecord {
   auth_status?: "ready" | "refreshable" | "expired" | "missing";
   auth_expires_at?: number | null;
   fallback_ids: string[];
+  last_diagnostic?: {
+    healthy: boolean;
+    code?: string | null;
+    summary?: string | null;
+    message?: string | null;
+    checked_at?: number | null;
+    source?: string | null;
+    fallback_provider_id?: string | null;
+    fallback_provider_name?: string | null;
+    history?: Array<{
+      status?: string | null;
+      code?: string | null;
+      summary?: string | null;
+      message?: string | null;
+      checked_at?: number | null;
+    }> | null;
+  } | null;
   is_active: boolean;
 }
 
@@ -157,9 +179,12 @@ export interface ChatMessage {
   driftScore?: number;
   status?: "streaming" | "done" | "warning" | "error";
   executionKind?: ExecutionEventRecord["kind"];
+  executionEvent?: ExecutionEventRecord["event"];
   executionPhase?: string;
   executionTitle?: string;
   executionDetail?: string;
+  executionMetadata?: Record<string, unknown>;
+  executionCorrelationKey?: string;
 }
 
 export interface ExecutionEventRecord {
@@ -210,6 +235,15 @@ export interface ParticipantCapabilityConfig {
   mcp_servers: string[];
 }
 
+export interface WorkspaceDiscoveredSkill {
+  name: string;
+  description: string;
+  summary: string;
+  path: string;
+  source_type: string;
+  source_label?: string | null;
+}
+
 export interface WorkspaceCapabilityManifest {
   skill_sources: SkillSourceConfig[];
   mcp_servers: MCPServerConfig[];
@@ -238,6 +272,8 @@ export interface StreamPayload {
   message?: string;
   provider_id?: string;
   provider_name?: string;
+  fallback_provider_id?: string;
+  fallback_provider_name?: string;
   auth_type?: string;
   remediation?: string;
   server_name?: string;
@@ -250,6 +286,10 @@ export interface StreamPayload {
   model_ref?: string;
   text?: string;
   ts?: number;
+  query?: string;
+  result_count?: number;
+  page_count?: number;
+  items?: string[];
 }
 
 export interface AuthFlowState {

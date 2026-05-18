@@ -90,8 +90,19 @@ CREATE TABLE IF NOT EXISTS provider_configs (
     auth_type       TEXT NOT NULL,
     auth_config     TEXT,
     fallback_ids    TEXT,
+    last_diagnostic TEXT,
     is_active       BOOLEAN DEFAULT TRUE
 );
+"""
+
+CREATE_SESSIONS_LIST_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_created_id
+ON collaboration_sessions(updated_at DESC, created_at DESC, id DESC);
+"""
+
+CREATE_MESSAGES_SESSION_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_messages_session_created_at
+ON collaboration_messages(session_id, created_at DESC, id DESC);
 """
 
 # Device_Code_Flow 认证会话表
@@ -159,6 +170,8 @@ ALL_DDL = [
     CREATE_CHECKPOINTS_TABLE,
     CREATE_PROVIDER_CONFIGS_TABLE,
     CREATE_AUTH_SESSIONS_TABLE,
+    CREATE_SESSIONS_LIST_INDEX,
+    CREATE_MESSAGES_SESSION_INDEX,
     CREATE_FTS_INSERT_TRIGGER,
     CREATE_FTS_DELETE_TRIGGER,
     CREATE_FTS_UPDATE_TRIGGER,
@@ -196,6 +209,12 @@ async def _ensure_compatible_schema(db: aiosqlite.Connection) -> None:
         table_name="auth_sessions",
         column_name="context_json",
         ddl="ALTER TABLE auth_sessions ADD COLUMN context_json TEXT",
+    )
+    await _ensure_column(
+        db,
+        table_name="provider_configs",
+        column_name="last_diagnostic",
+        ddl="ALTER TABLE provider_configs ADD COLUMN last_diagnostic TEXT",
     )
 
 

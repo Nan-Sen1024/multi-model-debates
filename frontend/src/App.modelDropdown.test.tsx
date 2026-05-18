@@ -195,13 +195,13 @@ describe("App dynamic model dropdown", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
-    expect(createSessionTab).toBeDefined();
+    expect(createTaskTab).toBeDefined();
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
@@ -249,13 +249,13 @@ describe("App dynamic model dropdown", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
-    expect(createSessionTab).toBeDefined();
+    expect(createTaskTab).toBeDefined();
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 
@@ -340,12 +340,12 @@ describe("App dynamic model dropdown", () => {
       await Promise.resolve();
     });
 
-    const createSessionTab = Array.from(container.querySelectorAll("button")).find((node) =>
-      node.textContent?.includes("创建会话"),
+    const createTaskTab = Array.from(container.querySelectorAll("button")).find((node) =>
+      node.textContent?.includes("新建任务"),
     ) as HTMLButtonElement | undefined;
 
     await act(async () => {
-      createSessionTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      createTaskTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();

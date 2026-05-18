@@ -26,6 +26,7 @@ from .llm_gateway import (
 )
 from .message_store import MessageStore
 from .models import AuthConfig, Checkpoint, CollaborationMessage, ModelParticipant, ProviderConfig, Session, SessionConfig, SessionSnapshot, WorkspaceConfig
+from .provider_diagnostics import persist_provider_diagnostic
 from .workspace_context import build_workspace_file_context, build_workspace_skill_context
 from .workspace_capabilities import (
     AgentProfileConfig,
@@ -314,7 +315,7 @@ class SessionOrchestrator:
                         SELECT m.content
                         FROM collaboration_messages m
                         WHERE m.session_id = s.id
-                        ORDER BY m.created_at DESC, m.rowid DESC
+                        ORDER BY m.created_at DESC, m.id DESC
                         LIMIT 1
                     ) AS last_message_preview
                 FROM collaboration_sessions s
@@ -829,6 +830,14 @@ class SessionOrchestrator:
                 target_count=len(targets),
             )
             if not targets:
+                yield StreamChunk(
+                    "error",
+                    round_number=session.current_round,
+                    metadata={
+                        "code": "NO_WORKSPACE_TARGETS",
+                        "message": "工作区消息没有 @ 目标；请使用 @alias 或 @all 触发执行。",
+                    },
+                )
                 return
 
             runtime.is_generating = True
@@ -939,6 +948,7 @@ class SessionOrchestrator:
                                         model_stream_factory=collect_agent_model_output,
                                         persist_tool_message=self.message_store.store_message,
                                         emit_event=emit_agent_event,
+                                        latest_user_message=latest_user_message,
                                     )
                                 finally:
                                     await agent_event_queue.put(None)
@@ -1573,23 +1583,72 @@ class SessionOrchestrator:
                 ):
                     emitted_output = True
                     yield chunk
+                await persist_provider_diagnostic(
+                    provider.id,
+                    {
+                        "healthy": True,
+                        "summary": "连通性正常",
+                        "message": "Provider 调用成功",
+                        "source": "session_runtime",
+                    },
+                    db_path=self.db_path,
+                )
                 return
             except Exception as exc:
                 if emitted_output:
                     raise
                 setattr(exc, "_mmd_provider_config", provider)
                 last_error = exc
+                fallback_provider = (
+                    provider_candidates[index + 1]
+                    if index < len(provider_candidates) - 1
+                    else None
+                )
+                await persist_provider_diagnostic(
+                    provider.id,
+                    {
+                        "healthy": False,
+                        "code": _participant_error_code(exc),
+                        "summary": (
+                            "主路鉴权失败，已切换 fallback"
+                            if isinstance(exc, AuthenticationError) and fallback_provider is not None
+                            else "认证失败"
+                            if isinstance(exc, AuthenticationError)
+                            else "主路失败，已切换 fallback"
+                            if fallback_provider is not None
+                            else "Provider 调用失败"
+                        ),
+                        "message": str(exc),
+                        "source": "session_runtime",
+                        "fallback_provider_id": fallback_provider.id if fallback_provider is not None else None,
+                        "fallback_provider_name": fallback_provider.name if fallback_provider is not None else None,
+                    },
+                    db_path=self.db_path,
+                )
                 logger.warning(
                     "Provider %s failed before emitting output for %s",
                     provider.name,
                     participant.custom_id,
                 )
-                if index < len(provider_candidates) - 1:
+                if fallback_provider is not None:
                     yield StreamChunk(
                         "participant_error",
                         participant_id=participant.custom_id,
                         round_number=round_number,
                         metadata=_participant_error_metadata(exc, participant, provider),
+                    )
+                    yield StreamChunk(
+                        "provider_fallback",
+                        participant_id=participant.custom_id,
+                        round_number=round_number,
+                        metadata={
+                            "code": _participant_error_code(exc),
+                            "message": str(exc),
+                            "provider_id": provider.id,
+                            "provider_name": provider.name,
+                            "fallback_provider_id": fallback_provider.id,
+                            "fallback_provider_name": fallback_provider.name,
+                        },
                     )
 
         if last_error is not None:
@@ -1704,6 +1763,7 @@ class SessionOrchestrator:
         model_ref: str,
         seen: set[str],
     ) -> List[ProviderConfig]:
+        allows_same_type_fallback = "/" not in model_ref.strip()
         requested_model = model_ref.split("/", 1)[-1].strip()
         if not requested_model:
             return []
@@ -1720,10 +1780,11 @@ class SessionOrchestrator:
             if provider.id in seen:
                 continue
             default_ref = provider.auth_config.metadata.get("default_model_ref")
-            if default_ref is None:
-                continue
-            normalized_default = str(default_ref).split("/", 1)[-1].strip()
-            if normalized_default != requested_model:
+            if default_ref is not None:
+                normalized_default = str(default_ref).split("/", 1)[-1].strip()
+                if normalized_default != requested_model:
+                    continue
+            elif not allows_same_type_fallback or provider.provider_type != primary.provider_type:
                 continue
             resolved.append(provider)
             seen.add(provider.id)
@@ -1792,6 +1853,3 @@ class SessionOrchestrator:
     @staticmethod
     def _from_timestamp(timestamp: int) -> datetime:
         return datetime.fromtimestamp(timestamp, tz=timezone.utc).replace(tzinfo=None)
-
-
-

@@ -129,6 +129,16 @@ def _httpx_invocation_error_message(exc: BaseException, *, prefix: str = "httpx 
     return message
 
 
+def _is_provider_auth_failure(exc: BaseException) -> bool:
+    if isinstance(exc, AuthenticationError):
+        return True
+    if isinstance(exc, ProviderUnavailableError):
+        detail = str(exc).lower()
+        return "http 401" in detail or "http 403" in detail or "unauthorized" in detail or "forbidden" in detail
+    detail = str(exc).lower()
+    return "http 401" in detail or "http 403" in detail or "unauthorized" in detail or "forbidden" in detail
+
+
 def _load_litellm() -> bool:
     global litellm, _LITELLM_AVAILABLE
 
@@ -1670,6 +1680,8 @@ class LLMGatewayClient:
                 yield chunk
             return
         except Exception as exc:
+            if _is_provider_auth_failure(exc):
+                raise AuthenticationError(str(exc), provider=provider_name) from exc
             if isinstance(exc, ProviderUnavailableError):
                 raise
             if emitted_any or not _is_httpx_retryable_before_output(exc):
@@ -1692,9 +1704,13 @@ class LLMGatewayClient:
                 ):
                     yield chunk
                 return
-            except ProviderUnavailableError:
+            except ProviderUnavailableError as retry_exc:
+                if _is_provider_auth_failure(retry_exc):
+                    raise AuthenticationError(str(retry_exc), provider=provider_name) from retry_exc
                 raise
             except Exception as retry_exc:
+                if _is_provider_auth_failure(retry_exc):
+                    raise AuthenticationError(str(retry_exc), provider=provider_name) from retry_exc
                 raise ProviderUnavailableError(
                     _httpx_invocation_error_message(retry_exc),
                     provider=provider_name,
@@ -1872,7 +1888,28 @@ class LLMGatewayClient:
         try:
             async with httpx.AsyncClient() as client:  # type: ignore[union-attr]
                 response = await client.get(check_url, timeout=5)
-            return response.status_code < 500
+            if response.status_code >= 500:
+                return False
+            default_model_ref = provider_config.auth_config.metadata.get("default_model_ref")
+            if not isinstance(default_model_ref, str) or not default_model_ref.strip():
+                return response.status_code < 400
+
+            model_name = default_model_ref.strip().split("/", 1)[-1].strip()
+            if not model_name:
+                return response.status_code < 400
+            headers = self._auth_manager.get_headers(provider_config.auth_config)
+            async for _chunk in self._stream_openai_compatible(
+                endpoint=f"{base_url.rstrip('/')}/chat/completions",
+                model=model_name,
+                messages=[{"role": "user", "content": "health check"}],
+                headers=headers,
+                provider_name=provider_config.name or provider_config.provider_type.value,
+            ):
+                break
+            return True
+        except AuthenticationError as exc:
+            logger.debug("provider health auth failed for %s: %s", provider_config.name, exc)
+            return False
         except Exception as exc:
             logger.debug("provider health check failed for %s: %s", provider_config.name, exc)
             return False

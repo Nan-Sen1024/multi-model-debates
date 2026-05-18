@@ -1,5 +1,51 @@
 import { CollaborationMode } from "./types";
 
+export interface TaskTemplateOption {
+  id: string;
+  label: string;
+  blurb: string;
+  icon: string;
+  mode: CollaborationMode;
+  defaultTopic: string;
+}
+
+export const PRIMARY_TASK_TEMPLATES: TaskTemplateOption[] = [
+  {
+    id: "analyze_repo",
+    label: "Analyze Repo",
+    blurb: "基于本地代码工作区理解仓库结构、关键模块、风险点和后续建议。",
+    icon: "🧭",
+    mode: "code_workspace",
+    defaultTopic: "通读并分析这个仓库的结构、核心模块、风险点和后续建议。",
+  },
+  {
+    id: "fix_or_implement",
+    label: "Fix or Implement",
+    blurb: "围绕真实任务修改代码、执行命令并交付验证结果。",
+    icon: "🛠️",
+    mode: "code_workspace",
+    defaultTopic: "定位并修复当前问题，提交改动思路、影响文件和验证结果。",
+  },
+  {
+    id: "review_changes",
+    label: "Review Changes",
+    blurb: "组织多模型对变更、方案或仓库片段做结构化评审。",
+    icon: "🧾",
+    mode: "peer_review",
+    defaultTopic: "评审当前改动或方案，输出主要问题、风险和建议。",
+  },
+  {
+    id: "compare_approaches",
+    label: "Compare Approaches",
+    blurb: "让多个模型并行比较方案、取舍和执行路径。",
+    icon: "⚖️",
+    mode: "brainstorm",
+    defaultTopic: "比较几种可行方案的优缺点、成本和推荐路径。",
+  },
+];
+
+export const DEFAULT_TASK_TEMPLATE_ID = PRIMARY_TASK_TEMPLATES[0].id;
+
 export const MODE_OPTIONS: Array<{
   value: CollaborationMode;
   label: string;

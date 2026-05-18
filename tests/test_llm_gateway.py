@@ -666,6 +666,36 @@ class TestLLMGatewayClientHealthCheck:
         result = asyncio.run(run())
         assert result is True
 
+    def test_health_check_returns_false_when_default_model_auth_fails(self):
+        provider = make_provider(
+            "waicc",
+            provider_type=ProviderType.OPENAI,
+            base_url="http://api.example.test/v1",
+        )
+        provider.auth_config.metadata["default_model_ref"] = "gpt-5.4"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        async def run():
+            client = LLMGatewayClient()
+            with patch("backend.llm_gateway._HTTPX_AVAILABLE", True):
+                with patch("httpx.AsyncClient") as mock_client_cls:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock(return_value=False)
+                    mock_client.get = AsyncMock(return_value=mock_resp)
+                    mock_client_cls.return_value = mock_client
+                    with patch.object(
+                        client,
+                        "_stream_openai_compatible",
+                        side_effect=AuthenticationError("token invalid", provider="waicc"),
+                    ):
+                        return await client.health_check(provider)
+
+        result = asyncio.run(run())
+        assert result is False
+
 
 # ===========================================================================
 # 8. LLMGatewayClient get_local_models（10.1）

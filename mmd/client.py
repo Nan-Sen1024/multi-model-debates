@@ -74,11 +74,15 @@ class MmdClient:
         method: str = "GET",
         json_body: Optional[MutableMapping[str, Any]] = None,
     ) -> Any:
-        response = self._client.request(
-            method=method,
-            url=_join_api_path(path),
-            json=json_body,
-        )
+        target = f"{self.base_url}{_join_api_path(path)}"
+        try:
+            response = self._client.request(
+                method=method,
+                url=_join_api_path(path),
+                json=json_body,
+            )
+        except httpx.RequestError as exc:
+            raise MmdClientError(f"Cannot reach backend at {target}: {exc}") from exc
         if response.status_code >= 400:
             data = None
             try:

@@ -35,16 +35,19 @@ from .llm_gateway import (
     serialize_auth_config,
 )
 from .models import AuthConfig, ProviderConfig, WorkspaceConfig
+from .provider_diagnostics import normalize_provider_diagnostic, persist_provider_diagnostic
 from .workspace_reader import read_workspace_file
 from .workspace_scanner import scan_workspace
+from .workspace_skills import discover_workspace_skills, workspace_skills_to_payload
 from .workspace_capabilities import workspace_capabilities_from_dict, workspace_capabilities_to_dict
 from .orchestrator import CreateSessionRequest, ParticipantInput, SessionOrchestrator, StreamChunk
 
 app = FastAPI(title="Multi-Model Debate Backend")
 logger = logging.getLogger(__name__)
+DEFAULT_ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
 ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    for origin in os.getenv("ALLOWED_ORIGINS", DEFAULT_ALLOWED_ORIGINS).split(",")
     if origin.strip()
 ]
 app.add_middleware(
@@ -134,6 +137,7 @@ class WorkspacePayload(BaseModel):
 class WorkspacePreviewPayload(BaseModel):
     root_path: str
     scan_excludes: List[str] = Field(default_factory=list)
+    capabilities: Optional["WorkspaceCapabilityManifestPayload"] = None
 
 
 class SkillSourcePayload(BaseModel):
@@ -190,6 +194,18 @@ class ProviderPayload(BaseModel):
     auth_value: Optional[str] = None
     auth_metadata: Dict[str, Any] = Field(default_factory=dict)
     fallback_ids: List[str] = Field(default_factory=list)
+
+
+class ProviderDiagnosticPayload(BaseModel):
+    healthy: bool
+    code: Optional[str] = None
+    summary: Optional[str] = None
+    message: Optional[str] = None
+    checked_at: Optional[int] = None
+    source: Optional[str] = None
+    fallback_provider_id: Optional[str] = None
+    fallback_provider_name: Optional[str] = None
+    history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 def error_response(exc: ValidationError, status_code: int = 400) -> JSONResponse:
@@ -297,6 +313,7 @@ def _workspace_scan_payload(
     selected_paths: List[str],
     index_status: str,
     capabilities: Optional[Dict[str, Any]],
+    discovered_skills: Optional[List[Dict[str, Any]]],
     scan_result: Any,
 ) -> Dict[str, Any]:
     return {
@@ -309,6 +326,7 @@ def _workspace_scan_payload(
         "last_scanned_at": scan_result.scanned_at,
         "summary": scan_result.summary,
         "capabilities": capabilities,
+        "discovered_skills": list(discovered_skills or []),
         "files": scan_result.files,
         "tree": _workspace_tree_payload(scan_result.tree),
     }
@@ -577,6 +595,9 @@ async def get_session_workspace(session_id: str):
         workspace.last_scanned_at = scan_result.scanned_at
         workspace.index_status = "ready"
         await orchestrator._persist_session_runtime(session)
+        discovered_skills = workspace_skills_to_payload(
+            discover_workspace_skills(workspace.root_path, workspace.capabilities)
+        )
         return _workspace_scan_payload(
             root_path=workspace.root_path,
             display_name=workspace.display_name,
@@ -584,6 +605,7 @@ async def get_session_workspace(session_id: str):
             selected_paths=list(workspace.selected_paths),
             index_status=workspace.index_status,
             capabilities=workspace_capabilities_to_dict(workspace.capabilities),
+            discovered_skills=discovered_skills,
             scan_result=scan_result,
         )
     except ValidationError as exc:
@@ -616,14 +638,19 @@ async def preview_workspace(payload: WorkspacePreviewPayload):
         if not root_path:
             raise ValidationError("工作区路径不能为空。", field="workspace.root_path")
         scan_excludes = [item.strip() for item in payload.scan_excludes if item.strip()]
+        capabilities = workspace_capability_config_from_payload(payload.capabilities)
         scan_result = scan_workspace(root_path, scan_excludes)
+        discovered_skills = workspace_skills_to_payload(
+            discover_workspace_skills(root_path, capabilities)
+        )
         return _workspace_scan_payload(
             root_path=root_path,
             display_name=None,
             scan_excludes=scan_excludes,
             selected_paths=[],
             index_status="ready",
-            capabilities=None,
+            capabilities=workspace_capabilities_to_dict(capabilities),
+            discovered_skills=discovered_skills,
             scan_result=scan_result,
         )
     except ValidationError as exc:
@@ -842,6 +869,7 @@ async def list_providers():
                 "auth_status": auth_status,
                 "auth_expires_at": auth_expires_at,
                 "fallback_ids": json.loads(row["fallback_ids"] or "[]"),
+                "last_diagnostic": json.loads(row["last_diagnostic"] or "null"),
                 "is_active": bool(row["is_active"]),
             }
         )
@@ -881,7 +909,27 @@ async def provider_health(provider_id: str):
     provider = await _load_provider_config(provider_id)
     if provider is None:
         raise HTTPException(status_code=404, detail="provider not found")
-    return {"healthy": await check_provider_connectivity(provider)}
+    healthy = await check_provider_connectivity(provider)
+    diagnostic = await persist_provider_diagnostic(
+        provider_id,
+        {
+            "healthy": healthy,
+            "code": None if healthy else "PROVIDER_UNAVAILABLE",
+            "summary": "连通性正常" if healthy else "健康检查失败",
+            "message": "Provider 健康检查通过" if healthy else "请检查网络、模型配置或认证状态。",
+            "source": "manual_health_check",
+        },
+        db_path=DB_PATH,
+    )
+    return diagnostic or {"healthy": healthy}
+
+
+@app.post("/api/providers/{provider_id}/diagnostic")
+async def update_provider_diagnostic(provider_id: str, payload: ProviderDiagnosticPayload):
+    diagnostic = await persist_provider_diagnostic(provider_id, payload.model_dump(), db_path=DB_PATH)
+    if diagnostic is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    return diagnostic
 
 
 @app.get("/api/providers/local/discover")

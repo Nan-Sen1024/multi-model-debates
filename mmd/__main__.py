@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from typing import Any, Dict, Iterable, List
 
 from .catalog import ModelResolutionError
 from .catalog import load_model_catalogs
 from .catalog import resolve_participant_model_selection
 from .client import MmdClient
+from .client import MmdClientError
 from .commands import parse_participant_spec
 from .launcher import run_default_terminal
 from .launcher import resolve_default_session
@@ -345,41 +347,45 @@ def cmd_attach(client: MmdClient, session_id: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    with MmdClient(base_url=args.base_url, timeout=args.timeout, trust_env=False) as client:
-        if not args.command:
-            return run_default_terminal(
-                client,
-                cwd=os.getcwd(),
-                session_id=os.environ.get("MMD_SESSION_ID"),
-            )
-        if args.command == "sessions":
-            return cmd_sessions(client)
-        if args.command == "status":
-            return cmd_status(
-                client,
-                cwd=os.getcwd(),
-                session_id=os.environ.get("MMD_SESSION_ID"),
-            )
-        if args.command == "providers":
-            return cmd_providers(client)
-        if args.command == "models":
-            return cmd_models(
-                client,
-                action=args.action,
-                model_ref=args.model_ref,
-                cwd=os.getcwd(),
-                session_id=os.environ.get("MMD_SESSION_ID"),
-            )
-        if args.command == "attach":
-            return cmd_attach(client, args.session_id)
-        if args.command == "shell":
-            return cmd_shell(
-                client,
-                cwd=os.getcwd(),
-                session_id=(args.session_id or os.environ.get("MMD_SESSION_ID")),
-            )
-        if args.command == "new":
-            return cmd_new(client, args)
+    try:
+        with MmdClient(base_url=args.base_url, timeout=args.timeout, trust_env=False) as client:
+            if not args.command:
+                return run_default_terminal(
+                    client,
+                    cwd=os.getcwd(),
+                    session_id=os.environ.get("MMD_SESSION_ID"),
+                )
+            if args.command == "sessions":
+                return cmd_sessions(client)
+            if args.command == "status":
+                return cmd_status(
+                    client,
+                    cwd=os.getcwd(),
+                    session_id=os.environ.get("MMD_SESSION_ID"),
+                )
+            if args.command == "providers":
+                return cmd_providers(client)
+            if args.command == "models":
+                return cmd_models(
+                    client,
+                    action=args.action,
+                    model_ref=args.model_ref,
+                    cwd=os.getcwd(),
+                    session_id=os.environ.get("MMD_SESSION_ID"),
+                )
+            if args.command == "attach":
+                return cmd_attach(client, args.session_id)
+            if args.command == "shell":
+                return cmd_shell(
+                    client,
+                    cwd=os.getcwd(),
+                    session_id=(args.session_id or os.environ.get("MMD_SESSION_ID")),
+                )
+            if args.command == "new":
+                return cmd_new(client, args)
+    except MmdClientError as exc:
+        print(f"mmd: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .workspace_capabilities import WorkspaceCapabilityManifest
 from .workspace_scanner import _resolve_workspace_root
@@ -77,6 +77,20 @@ def render_workspace_skill_context(skills: Iterable[WorkspaceSkill]) -> str:
             lines.append(f"  来源: {skill.source_label}")
     lines.append("[工作区技能结束]")
     return "\n".join(lines)
+
+
+def workspace_skills_to_payload(skills: Iterable[WorkspaceSkill]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": skill.name,
+            "description": skill.description,
+            "summary": skill.summary,
+            "path": skill.path.replace("\\", "/"),
+            "source_type": skill.source_type,
+            "source_label": skill.source_label,
+        }
+        for skill in skills
+    ]
 
 
 def _filter_skills_by_name(skills: List[WorkspaceSkill], allowed_names: Iterable[str]) -> List[WorkspaceSkill]:

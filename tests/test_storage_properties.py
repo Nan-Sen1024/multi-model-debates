@@ -46,6 +46,14 @@ async def seed_session(db_path: str, session_id: str) -> None:
         await db.commit()
 
 
+async def _list_index_names(db_path: str, table_name: str) -> list[str]:
+    await init_db(db_path)
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(f"PRAGMA index_list('{table_name}')") as cursor:
+            rows = await cursor.fetchall()
+    return [row[1] for row in rows]
+
+
 single_line_text = st.text(
     alphabet=st.characters(
         blacklist_categories=("Cc", "Cs"),
@@ -126,3 +134,12 @@ def test_property_message_history_prefix_format(messages):
             assert line == f"[{message.sender_id}|{message.message_type.value}]: [工具输出已遮蔽]"
         else:
             assert line == f"[{message.sender_id}|{message.message_type.value}]: {message.content}"
+
+
+def test_init_db_creates_session_list_indexes():
+    store = make_store()
+    message_indexes = run(_list_index_names(store.db_path, "collaboration_messages"))
+    session_indexes = run(_list_index_names(store.db_path, "collaboration_sessions"))
+
+    assert "idx_messages_session_created_at" in message_indexes
+    assert "idx_sessions_updated_created_id" in session_indexes
